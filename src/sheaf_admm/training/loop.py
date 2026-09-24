@@ -33,7 +33,7 @@ def move_to_device(tree, device):
     return tree
 
 
-def _forward(model, fwd, *, n_iter, loss_window, model_type, training):
+def _forward(model, fwd, *, n_iter, loss_window, model_type, training, compile_steps=True):
     if model_type == "sheaf":
         logits_window, _state, _geom = model(
             fwd["patches"],
@@ -42,6 +42,7 @@ def _forward(model, fwd, *, n_iter, loss_window, model_type, training):
             loss_window=loss_window,
             **fwd["model_kwargs"],
             training=training,
+            compile_steps=compile_steps,
         )
         return logits_window
     logits, _hidden = model(
@@ -50,6 +51,7 @@ def _forward(model, fwd, *, n_iter, loss_window, model_type, training):
         num_rounds=n_iter,
         **fwd["model_kwargs"],
         training=training,
+        compile_steps=compile_steps,
     )
     return logits
 
@@ -71,10 +73,21 @@ def create_train_state(
 ):
     torch.manual_seed(int(seed))
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    if device.type == "cuda":
+        # A training process may run several model shapes; each gets fresh compiler guards.
+        torch.compiler.reset()
     model.to(device)
     sample_fwd = move_to_device(sample_fwd, device)
     with torch.no_grad():
-        _forward(model, sample_fwd, n_iter=1, loss_window=1, model_type=model_type, training=False)
+        _forward(
+            model,
+            sample_fwd,
+            n_iter=1,
+            loss_window=1,
+            model_type=model_type,
+            training=False,
+            compile_steps=False,
+        )
     optimizer = make_optimizer(model.parameters(), lr, weight_decay, warmup_steps, grad_clip)
     state = TrainState(
         model, optimizer, make_schedule(lr, warmup_steps), float(grad_clip), float(ema_decay)

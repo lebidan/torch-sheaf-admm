@@ -2,10 +2,19 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 from torch import nn
 
 from .layers import Dense, LazyDense, MLPBlock, RMSNorm
+
+
+def _ggnn_round(cell, hidden, context, edge_indices, direction_ids):
+    return cell(hidden, context, edge_indices, direction_ids)
+
+
+_compiled_ggnn_round = torch.compile(_ggnn_round, mode="reduce-overhead", fullgraph=True)
 
 
 class GraphClassificationHead(nn.Module):
@@ -161,13 +170,29 @@ class DirectionalGGNN(nn.Module):
         )
 
     def forward(
-        self, hidden0, context, edge_indices, direction_ids, num_rounds, return_history=False
+        self,
+        hidden0,
+        context,
+        edge_indices,
+        direction_ids,
+        num_rounds,
+        return_history=False,
+        compile_round=False,
     ):
         if num_rounds < 1:
             raise ValueError("num_rounds must be >= 1")
         hidden, history = hidden0, []
+        round_fn = (
+            _compiled_ggnn_round
+            if compile_round
+            and hidden0.is_cuda
+            and os.environ.get("TORCH_COMPILE_DISABLE") != "1"
+            else _ggnn_round
+        )
         for _ in range(num_rounds):
-            hidden = self.cell(hidden, context, edge_indices, direction_ids)
+            hidden = round_fn(self.cell, hidden, context, edge_indices, direction_ids)
+            if round_fn is _compiled_ggnn_round and not torch.is_grad_enabled():
+                hidden = hidden.clone()
             if return_history:
                 history.append(hidden)
         return (hidden, torch.stack(history)) if return_history else hidden

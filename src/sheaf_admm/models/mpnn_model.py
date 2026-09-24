@@ -108,6 +108,7 @@ class MPNNModel(nn.Module):
         map_v=None,
         cell_ids=None,
         training=True,
+        compile_steps=True,
     ):
         c = self.config
         edge_indices = torch.as_tensor(edge_indices, device=patches.device, dtype=torch.long)
@@ -144,7 +145,14 @@ class MPNNModel(nn.Module):
             enc = self.encoder(flat, training=training)
         context = enc["h"].reshape(n, b, c.d_v)
         directed, types = self._directed_edges(edge_indices, node_positions, map_u, map_v)
-        hidden = self.ggnn(self.init_hidden(context), context, directed, types, num_rounds)
+        hidden = self.ggnn(
+            self.init_hidden(context),
+            context,
+            directed,
+            types,
+            num_rounds,
+            compile_round=compile_steps,
+        )
         if self.graph_head is not None:
             return self.graph_head(hidden.mean(dim=0)), hidden
         logits = self.decoder(hidden.reshape(n * b, c.d_v), flat, training=training)

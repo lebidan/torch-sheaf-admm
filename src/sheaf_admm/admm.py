@@ -25,6 +25,7 @@ Either way only the last ``loss_window`` x-iterates are materialized.
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -41,6 +42,29 @@ class ADMMState:
     x: torch.Tensor  # local proposal (primal)
     z: torch.Tensor  # consensus iterate
     y: torch.Tensor  # scaled dual accumulator (u = lambda / rho)
+
+
+def _admm_step(
+    state: ADMMState,
+    encoder_output: dict[str, Any],
+    geometry: SheafGeometry,
+    x_solver: XSolver,
+    x_params: XSolverParams,
+    z_solver: ZSolver,
+    z_params: ZSolverParams,
+    rho: torch.Tensor,
+    alpha: float,
+) -> ADMMState:
+    z_prev = state.z
+    x = x_solver.solve(state.z, state.y, rho, encoder_output, x_params)
+    x_relaxed = x if alpha == 1.0 else alpha * x + (1.0 - alpha) * z_prev
+    z_target = x_relaxed + state.y
+    z = z_solver.solve(z_target, z_prev, geometry, z_params, rho)
+    y = state.y + (x_relaxed - z)
+    return ADMMState(x=x, z=z, y=y)
+
+
+_compiled_admm_step = torch.compile(_admm_step, mode="reduce-overhead", fullgraph=True)
 
 
 def inverse_softplus(x: float) -> float:
@@ -67,6 +91,7 @@ def run_admm(
     relaxation_alpha: float = 1.0,
     loss_window: int = 1,
     grad_window: int | None = None,
+    compile_step: bool = False,
 ) -> tuple[ADMMState, torch.Tensor]:
     """Run ``num_iters`` ADMM steps.
 
@@ -74,15 +99,16 @@ def run_admm(
     local proposals ``x`` of shape ``[W, N, B, d_v]`` (oldest first).
     """
     alpha = relaxation_alpha
+    use_compile = compile_step and z_init.is_cuda and os.environ.get("TORCH_COMPILE_DISABLE") != "1"
 
     def step(state: ADMMState) -> ADMMState:
-        z_prev = state.z
-        x = x_solver.solve(state.z, state.y, rho, encoder_output, x_params)
-        x_relaxed = x if alpha == 1.0 else alpha * x + (1.0 - alpha) * z_prev
-        z_target = x_relaxed + state.y
-        z = z_solver.solve(z_target, z_prev, geometry, z_params, rho)
-        y = state.y + (x_relaxed - z)
-        return ADMMState(x=x, z=z, y=y)
+        operation = _compiled_admm_step if use_compile else _admm_step
+        next_state = operation(
+            state, encoder_output, geometry, x_solver, x_params, z_solver, z_params, rho, alpha
+        )
+        if use_compile and not torch.is_grad_enabled():
+            return ADMMState(next_state.x.clone(), next_state.z.clone(), next_state.y.clone())
+        return next_state
 
     state = ADMMState(x=z_init, z=z_init, y=torch.zeros_like(z_init))
 

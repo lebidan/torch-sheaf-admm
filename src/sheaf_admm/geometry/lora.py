@@ -34,6 +34,7 @@ class LoRAGeometry:
     gate_u_edge: torch.Tensor | None = None  # [E, B]
     gate_v_edge: torch.Tensor | None = None  # [E, B]
     edge_mask: torch.Tensor | None = None  # [E] float mask
+    effective_maps: torch.Tensor | None = None  # [E, 2, B, d_e, d_v] for small stalks
 
     def replace(self, **changes):
         return replace(self, **changes)
@@ -62,12 +63,16 @@ class LoRAGeometry:
 
     def edge_residuals(self, z: torch.Tensor) -> torch.Tensor:
         u, v = self.edge_indices[:, 0].long(), self.edge_indices[:, 1].long()
-        Fz_u = self._apply_endpoint(
-            z[u], self.restriction_maps[:, 0], self.A_u_edge, self.B_u_edge, self.gate_u_edge
-        )
-        Fz_v = self._apply_endpoint(
-            z[v], self.restriction_maps[:, 1], self.A_v_edge, self.B_v_edge, self.gate_v_edge
-        )
+        if self.effective_maps is not None:
+            Fz_u = torch.einsum("ebij,ebj->ebi", self.effective_maps[:, 0], z[u])
+            Fz_v = torch.einsum("ebij,ebj->ebi", self.effective_maps[:, 1], z[v])
+        else:
+            Fz_u = self._apply_endpoint(
+                z[u], self.restriction_maps[:, 0], self.A_u_edge, self.B_u_edge, self.gate_u_edge
+            )
+            Fz_v = self._apply_endpoint(
+                z[v], self.restriction_maps[:, 1], self.A_v_edge, self.B_v_edge, self.gate_v_edge
+            )
         r = Fz_u - Fz_v
         if self.edge_mask is not None:
             r = r * self.edge_mask[:, None, None]
@@ -79,12 +84,16 @@ class LoRAGeometry:
     def laplacian_apply(self, z: torch.Tensor) -> torch.Tensor:
         r = self.edge_residuals(z)  # [E, B, d_e]
         u, v = self.edge_indices[:, 0].long(), self.edge_indices[:, 1].long()
-        contrib_u = self._adjoint_endpoint(
-            r, self.restriction_maps[:, 0], self.A_u_edge, self.B_u_edge, self.gate_u_edge
-        )
-        contrib_v = self._adjoint_endpoint(
-            r, self.restriction_maps[:, 1], self.A_v_edge, self.B_v_edge, self.gate_v_edge
-        )
+        if self.effective_maps is not None:
+            contrib_u = torch.einsum("ebij,ebi->ebj", self.effective_maps[:, 0], r)
+            contrib_v = torch.einsum("ebij,ebi->ebj", self.effective_maps[:, 1], r)
+        else:
+            contrib_u = self._adjoint_endpoint(
+                r, self.restriction_maps[:, 0], self.A_u_edge, self.B_u_edge, self.gate_u_edge
+            )
+            contrib_v = self._adjoint_endpoint(
+                r, self.restriction_maps[:, 1], self.A_v_edge, self.B_v_edge, self.gate_v_edge
+            )
         out = torch.zeros_like(z)
         out = out.index_add(0, u, contrib_u)
         out = out.index_add(0, v, -contrib_v)
@@ -137,6 +146,25 @@ def create_lora_geometry(
     dir_uv = compute_direction_index(dy, dx, num_directions)
     dir_vu = compute_direction_index(-dy, -dx, num_directions)
     A_u, A_v, B_u, B_v, g_u, g_v = _gather_edge_factors(edge_indices, A, B, gate, dir_uv, dir_vu)
+    # A full F = R + (alpha/r) A B^T is cheap for small stalks and can be reused
+    # throughout ADMM. Keep the factored form for larger stalks to limit memory.
+    effective_maps = None
+    if restriction_maps.shape[-1] <= 16:
+        scale = lora_alpha / A.shape[-1]
+
+        def materialize(R, A_edge, B_edge, g_edge):
+            delta = torch.einsum("ebir,ebjr->ebij", A_edge, B_edge)
+            if g_edge is not None:
+                delta = delta * g_edge[:, :, None, None]
+            return R[:, None] + scale * delta
+
+        effective_maps = torch.stack(
+            (
+                materialize(restriction_maps[:, 0], A_u, B_u, g_u),
+                materialize(restriction_maps[:, 1], A_v, B_v, g_v),
+            ),
+            dim=1,
+        )
     return LoRAGeometry(
         edge_indices=edge_indices,
         restriction_maps=restriction_maps,
@@ -148,6 +176,7 @@ def create_lora_geometry(
         gate_u_edge=g_u,
         gate_v_edge=g_v,
         edge_mask=edge_mask,
+        effective_maps=effective_maps,
     )
 
 

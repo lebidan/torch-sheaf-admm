@@ -203,6 +203,7 @@ class SheafADMMModel(nn.Module):
         map_v=None,
         cell_ids=None,
         training=True,
+        compile_steps=True,
     ):
         edge_indices = torch.as_tensor(edge_indices, device=patches.device, dtype=torch.long)
         node_positions = (
@@ -242,6 +243,7 @@ class SheafADMMModel(nn.Module):
             relaxation_alpha=self.config.relaxation_alpha,
             loss_window=loss_window,
             grad_window=grad_window,
+            compile_step=compile_steps,
         )
         return self._decode_window(window, patches, training), final, geometry
 

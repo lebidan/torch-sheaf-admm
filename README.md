@@ -1,6 +1,6 @@
 # Torch-Sheaf-ADMM: educational PyTorch port of Sheaf-ADMM
 
-This repository is an **unofficial PyTorch port** by **Raphaël Le Bidan** for
+This repository is an **unofficial PyTorch port** for
 students and educational projects, created with the help of **Codex (GPT-6)**.
 Full credit for the
 algorithm, paper, and original JAX implementation belongs to **Jeffrey Seely,
@@ -117,7 +117,59 @@ uv run python validation/check_cli_tasks.py
 
 With an NVIDIA GPU, repeat the three device-selectable validation commands with
 `--device cuda`.
+Run `uv run python -m pytest -q tests/test_compile_parity.py` to compare one
+compiled and eager parameter update for each model family on CUDA.
 The frozen JAX reference fixtures are bundled, so these checks use Torch only.
+
+## Runtime on an RTX 4090
+
+CUDA training and evaluation compile one ADMM iteration or one MPNN round with
+`torch.compile` and reuse it throughout the loop. CPU runs use eager execution.
+Set `TORCH_COMPILE_DISABLE=1` to run eagerly for debugging or a short smoke
+test. The first call for a new model shape can spend tens of seconds compiling;
+the timings below measure subsequent calls.
+
+**Training step**
+
+| Experiment | Batch | Iterations | JAX | PyTorch | Torch / JAX |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Maze Sheaf | 128 | 40 | 67 ms | 73 ms | 1.09× |
+| Maze MPNN | 128 | 40 | 71 ms | 40 ms | 0.56× |
+| MNIST Sheaf | 128 | 20 | 145 ms | 169 ms | 1.16× |
+| MNIST MPNN | 128 | 20 | 17 ms | 20 ms | 1.19× |
+| Sudoku Sheaf | 32 | 20 | 71 ms | 73 ms | 1.03× |
+| Sudoku Sheaf LoRA | 16 | 20 | 72 ms | 78 ms | 1.09× |
+| Sudoku MPNN | 32 | 20 | 39 ms | 28 ms | 0.70× |
+
+**Evaluation forward pass**
+
+| Experiment | Batch | Iterations | JAX | PyTorch | Torch / JAX |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Maze Sheaf | 128 | 100 | 50 ms | 85 ms | 1.70× |
+| Maze MPNN | 128 | 100 | 41 ms | 30 ms | 0.72× |
+| MNIST Sheaf | 128 | 100 | 289 ms | 284 ms | 0.98× |
+| MNIST MPNN | 128 | 50 | 10 ms | 13 ms | 1.21× |
+| Sudoku Sheaf | 32 | 50 | 46 ms | 60 ms | 1.30× |
+| Sudoku Sheaf LoRA | 16 | 50 | 52 ms | 58 ms | 1.13× |
+| Sudoku MPNN | 32 | 50 | 21 ms | 25 ms | 1.19× |
+
+These are medians of five GPU-synchronized calls after two warmups on the same
+RTX 4090, with JAX 0.10.1 and PyTorch 2.14.0+cu130. Training includes
+synthetic batch preparation, device transfer, forward and backward passes, and
+the optimizer update. Evaluation includes preparation, transfer, and the model
+forward pass; it excludes task metrics and EMA swapping. Both exclude dataset
+I/O and first compilation. Starting weights come from each framework's own
+RNG, so this measures comparable work, not an identical trajectory. To repeat
+a case from this checkout, run:
+
+```bash
+uv run python scripts/benchmark_runtime.py --framework torch \
+  --experiment maze_sheaf --batch 128 --iters 40 --include-prep
+```
+
+The same script accepts `--framework jax` when run from the original JAX
+checkout with its CUDA environment. Add `--phase eval --iters 100` for an
+evaluation forward pass.
 
 ## How this port differs from the original JAX code
 
