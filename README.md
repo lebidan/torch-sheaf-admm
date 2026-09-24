@@ -1,4 +1,4 @@
-# Torch-Sheaf-ADMM: educational PyTorch port of Sheaf-ADMM
+# Torch-Sheaf-ADMM
 
 This repository is an **unofficial PyTorch port** for
 students and educational projects, created with the help of **Codex (GPT-6)**.
