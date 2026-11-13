@@ -74,11 +74,13 @@ class SheafADMMModel(nn.Module):
         )
         dec_kwargs = {"comm_dim": c.d_v, "input_shape": input_shape}
         if c.decoder_arch == "mlp_concat_v2":
-            shape = (
-                (*input_shape[:-1], c.num_classes)
-                if input_shape is not None
-                else (3, 3, c.num_classes)
-            )
+            shape = c.dec_output_shape
+            if shape is None:
+                shape = (
+                    (*input_shape[:-1], c.num_classes)
+                    if input_shape is not None
+                    else (3, 3, c.num_classes)
+                )
             dec_kwargs.update(
                 hidden_dim=c.dec_hidden_dim, output_shape=shape, dropout_rate=c.dropout_rate
             )

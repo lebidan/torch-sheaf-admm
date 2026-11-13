@@ -10,7 +10,7 @@ from .loop import (
     sample_k,
 )
 from .optim import TrainState, ema_update, eval_params, make_optimizer
-from .tasks import MazeTask, MNISTTask, SudokuTask, make_task
+from .tasks import MazeTask, MNISTTask, NQueensTask, SudokuTask, make_task
 
 __all__ = [
     "build_model",
@@ -25,5 +25,6 @@ __all__ = [
     "make_task",
     "MazeTask",
     "MNISTTask",
+    "NQueensTask",
     "SudokuTask",
 ]

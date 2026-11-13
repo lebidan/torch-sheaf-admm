@@ -154,6 +154,35 @@ def test_all_shipped_configs_forward(name):
     assert torch.isfinite(logits).all()
 
 
+def test_nqueens_experiment_forward_shape_without_training():
+    from sheaf_admm.training import make_task
+
+    cfg, data = _load("n_queens_sheaf")
+    assert cfg.dec_output_shape == (10, 2)
+    task = make_task(data["task"], **data.get("task_cfg", {}))
+    batch = {
+        "inputs": torch.ones((1, 100), dtype=torch.long),
+        "labels": torch.ones((1, 100), dtype=torch.long),
+        "height": 10,
+        "width": 10,
+    }
+    fwd, _, _ = task.prepare(batch)
+    model = build_model(cfg, data["model_type"], seed=0)
+    with torch.no_grad():
+        logits, _state, _geometry = model(
+            fwd["patches"],
+            fwd["edge_indices"],
+            num_iters=1,
+            loss_window=1,
+            **fwd["model_kwargs"],
+            training=False,
+            compile_steps=False,
+        )
+
+    assert logits.shape == (1, 20, 1, 10, 2)
+    assert torch.isfinite(logits).all()
+
+
 def test_sudoku_encoder_cell_block_layout():
     from sheaf_admm.models import create_encoder
 

@@ -4,7 +4,7 @@
 defaults:
   - _self_
 
-task: maze            # maze | mnist | sudoku  (selects the task hook)
+task: maze            # maze | mnist | sudoku | n_queens  (selects the task hook)
 model_type: sheaf     # sheaf | mpnn
 
 wandb:

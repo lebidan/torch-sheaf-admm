@@ -17,6 +17,10 @@ Two task families share this module:
   each cell is a 3-clique over its (row, col, box) agents, with per-edge
   shared-cell slots. Reassembly averages the three views that cover each cell
   (:func:`reassemble_sudoku_logits`).
+* **N-Queens.** A square board is covered by one agent per row and column
+  (:func:`nqueens_slice_batch_jax`). Each cell is shared by its row and column
+  agents; the graph records those intersections
+  (:func:`build_nqueens_multigraph`).
 
 Tensor conventions: images are ``[B, H, W, C]``, agent patches are
 ``[N, B, ph, pw, C]``, node states are ``[N, B, d_v]``, edges are ``[E, 2]``.
@@ -355,6 +359,65 @@ def sudoku_num_nodes(grid_size: int = 9) -> int:
 def sudoku_node_positions(num_nodes: int) -> torch.Tensor:
     ids = torch.arange(num_nodes)
     return torch.stack([ids // 9, ids % 9], dim=1).float()
+
+
+# =============================================================================
+# N-Queens views: one agent per row and column
+# =============================================================================
+
+
+def nqueens_slice_batch_jax(batch_grids: torch.Tensor) -> torch.Tensor:
+    """Return row and column views as ``[B, 2N, N, C]`` from ``[B, N, N, C]``."""
+    grids = torch.as_tensor(batch_grids)
+    if grids.ndim != 4 or grids.shape[1] != grids.shape[2]:
+        raise ValueError(f"expected square grids of shape (B,N,N,C); got {grids.shape}")
+    if grids.shape[1] == 0:
+        raise ValueError("N-Queens grids must have a positive size")
+    return torch.cat((grids, grids.transpose(1, 2)), dim=1)
+
+
+def reassemble_nqueens_logits(batch_logits: torch.Tensor) -> torch.Tensor:
+    """Average row/column predictions back to ``[B, N, N, C]``."""
+    logits = torch.as_tensor(batch_logits)
+    if logits.ndim != 4:
+        raise ValueError(f"expected logits of shape (B,2N,N,C); got {logits.shape}")
+    num_agents, line_length = logits.shape[1:3]
+    if line_length == 0 or num_agents != 2 * line_length:
+        raise ValueError(f"expected shape (B,2N,N,C); got {logits.shape}")
+    rows = logits[:, :line_length]
+    cols = logits[:, line_length:].transpose(1, 2)
+    return (rows + cols) / 2.0
+
+
+def build_nqueens_multigraph(
+    grid_size: int = 10,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build row/column intersection edges and the matching local cell slots.
+
+    Row agents are indexed ``0..N-1`` and column agents ``N..2N-1``.
+    Returns ``(edges, map_u, map_v)`` with one edge for each board cell.
+    """
+    if grid_size <= 0:
+        raise ValueError("grid_size must be positive")
+    cells = torch.arange(grid_size * grid_size, dtype=torch.long)
+    rows = torch.div(cells, grid_size, rounding_mode="floor")
+    cols = cells % grid_size
+    edges = torch.stack((rows, grid_size + cols), dim=1)
+    return edges, cols, rows
+
+
+def build_nqueens_cell_indices(grid_size: int = 10) -> torch.Tensor:
+    """Map each row/column agent's local slots to global cell IDs; shape ``[2N,N]``."""
+    if grid_size <= 0:
+        raise ValueError("grid_size must be positive")
+    cells = torch.arange(grid_size * grid_size, dtype=torch.long).reshape(grid_size, grid_size)
+    return torch.cat((cells, cells.transpose(0, 1)), dim=0)
+
+
+def nqueens_num_nodes(grid_size: int = 10) -> int:
+    if grid_size <= 0:
+        raise ValueError("grid_size must be positive")
+    return 2 * grid_size
 
 
 # =============================================================================

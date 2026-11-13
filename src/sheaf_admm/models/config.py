@@ -80,6 +80,7 @@ class ModelConfig:
     decoder_arch: str = "mlp_concat_v2"  # mlp_concat_v2 | sudoku | classification
     dec_hidden_dim: int = 256  # mlp_concat_v2
     dec_hidden_dims: tuple[int, ...] = (128,)  # sudoku / classification
+    dec_output_shape: tuple[int, ...] | None = None  # mlp_concat_v2 override
     dec_linear_head: bool = False  # classification linear head (MNIST)
     dec_readout_mode: str = "concat"  # classification: concat | x_only
     dec_norm_type: str = "rmsnorm"
@@ -100,7 +101,7 @@ def model_config_from_dict(d: dict[str, Any]) -> ModelConfig:
     unknown = set(out) - fields
     if unknown:
         raise KeyError(f"unknown ModelConfig fields: {sorted(unknown)}")
-    for k in ("dec_hidden_dims",):
+    for k in ("dec_hidden_dims", "dec_output_shape"):
         if k in out and out[k] is not None:
             out[k] = tuple(out[k])
     return ModelConfig(**out)

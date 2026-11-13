@@ -70,6 +70,89 @@ def test_sudoku_cell_indices():
     np.testing.assert_array_equal(counts, np.full(81, 3))
 
 
+def test_nqueens_row_column_views_roundtrip_and_graph():
+    size, batch, channels = 10, 2, 3
+    grids = torch.randn(batch, size, size, channels)
+
+    views = V.nqueens_slice_batch_jax(grids)
+    assert views.shape == (batch, 2 * size, size, channels)
+    np.testing.assert_allclose(
+        np.asarray(V.reassemble_nqueens_logits(views)), np.asarray(grids), atol=1e-6
+    )
+
+    cell_ids = V.build_nqueens_cell_indices(size)
+    assert cell_ids.shape == (2 * size, size)
+    counts = np.bincount(np.asarray(cell_ids).reshape(-1), minlength=size * size)
+    np.testing.assert_array_equal(counts, np.full(size * size, 2))
+    np.testing.assert_array_equal(np.asarray(cell_ids[0]), np.arange(size))
+    np.testing.assert_array_equal(np.asarray(cell_ids[size]), np.arange(0, size * size, size))
+
+    edges, map_u, map_v = V.build_nqueens_multigraph(size)
+    assert edges.shape == (size * size, 2)
+    assert map_u.shape == map_v.shape == (size * size,)
+    assert V.nqueens_num_nodes(size) == 2 * size
+    np.testing.assert_array_equal(np.asarray(edges[37]), [3, 17])
+    assert int(map_u[37]) == 7
+    assert int(map_v[37]) == 3
+
+
+def test_nqueens_views_reject_non_square_grids():
+    with np.testing.assert_raises_regex(ValueError, "expected square grids"):
+        V.nqueens_slice_batch_jax(torch.zeros(1, 10, 9, 3))
+
+
+def test_nqueens_task_prepares_loss_and_solution_metrics():
+    from sheaf_admm.training import NQueensTask, make_task
+
+    size = 10
+    queen_columns = [0, 2, 5, 7, 9, 4, 8, 1, 3, 6]
+    labels = np.ones((size, size), dtype=np.int64)
+    labels[np.arange(size), queen_columns] = 2
+    inputs = labels.copy()
+    inputs[3, queen_columns[3]] = 1
+    batch = {
+        "inputs": inputs.reshape(1, -1),
+        "labels": labels.reshape(1, -1),
+        "height": size,
+        "width": size,
+    }
+
+    task = make_task("n_queens")
+    assert isinstance(task, NQueensTask)
+    fwd, targets, aux = task.prepare(batch)
+    assert fwd["patches"].shape == (2 * size, 1, size, 3)
+    assert fwd["edge_indices"].shape == (size * size, 2)
+    assert fwd["model_kwargs"]["map_u"].shape == (size * size,)
+    assert targets["slice_labels"].shape == (2 * size, 1, size)
+    assert targets["labels_grid"].shape == (1, size, size)
+
+    logits_window = torch.randn(2, 2 * size, 1, size, 2)
+    loss = task.loss(logits_window, targets)
+    assert torch.isfinite(loss)
+    assert loss.item() > 0
+
+    slice_labels = targets["slice_labels"]
+    correct_logits = torch.full((2 * size, 1, size, 2), -8.0)
+    correct_logits.scatter_(-1, slice_labels[..., None], 8.0)
+    metrics = task.evaluate(correct_logits, targets, aux)
+    assert metrics == {
+        "cell_acc": 1.0,
+        "solved": 1.0,
+        "valid": 1.0,
+        "clues_preserved": 1.0,
+    }
+
+    invalid_grid = targets["labels_grid"].clone()
+    invalid_grid[0, 0, 1] = 1
+    invalid_views = V.nqueens_slice_batch_jax(invalid_grid[..., None])[..., 0].permute(1, 0, 2)
+    invalid_logits = torch.full((2 * size, 1, size, 2), -8.0)
+    invalid_logits.scatter_(-1, invalid_views[..., None], 8.0)
+    metrics = task.evaluate(invalid_logits, targets, aux)
+    assert metrics["solved"] == 0.0
+    assert metrics["valid"] == 0.0
+    assert metrics["clues_preserved"] == 1.0
+
+
 def test_maze_wall_border_prepad():
     """``prepare_maze_patches`` one-hots tokens and pads the *border* with the wall
     token, so a boundary agent whose patch runs out of bounds sees walls there
@@ -168,3 +251,45 @@ def test_puzzle_metadata_ignores_legacy_format_keys(tmp_path):
     assert metadata.seq_len == 35
     assert metadata.height == 5
     assert metadata.width == 7
+
+
+def test_nqueens_builder_writes_valid_puzzle_dataset(tmp_path):
+    from sheaf_admm.data.build_N_Queens import _write_split
+    from sheaf_admm.data.loaders import PuzzleDataset
+
+    size = 4
+    target = np.ones((size, size), dtype=np.int64)
+    queen_columns = [1, 3, 0, 2]
+    target[np.arange(size), queen_columns] = 2
+    input_board = target.copy()
+    input_board[0, queen_columns[0]] = 1
+    example = {
+        "n": size,
+        "num_solutions": 1,
+        "input": input_board.reshape(-1).tolist(),
+        "target": target.reshape(-1).tolist(),
+        "instance_id": "unique-example",
+    }
+
+    _write_split(tmp_path, "train", [example], size)
+    dataset = PuzzleDataset(tmp_path, "train")
+    puzzle_set = dataset.sets["all"]
+
+    assert dataset.metadata.vocab_size == 3
+    assert dataset.metadata.height == size
+    assert dataset.metadata.width == size
+    np.testing.assert_array_equal(puzzle_set.inputs[0].reshape(size, size), input_board)
+    np.testing.assert_array_equal(puzzle_set.labels[0].reshape(size, size), target)
+
+
+def test_nqueens_builder_rejects_invalid_target():
+    from sheaf_admm.data.build_N_Queens import _validate_example
+
+    example = {
+        "n": 4,
+        "num_solutions": 1,
+        "input": [1] * 16,
+        "target": [2] * 16,
+    }
+    with np.testing.assert_raises_regex(ValueError, "target must contain 4 queens"):
+        _validate_example(example, board_size=4)

@@ -145,8 +145,93 @@ class SudokuTask:
         }
 
 
+class NQueensTask:
+    name = "n_queens"
+    input_num_classes = 3
+
+    def prepare(self, batch):
+        inputs = torch.as_tensor(batch["inputs"], dtype=torch.long)
+        labels = torch.as_tensor(batch["labels"], dtype=torch.long)
+        if inputs.ndim != 2 or labels.shape != inputs.shape:
+            raise ValueError("N-Queens inputs and labels must have the same [B, N*N] shape")
+
+        height, width = V.infer_image_hw(
+            inputs.shape[1], batch.get("height"), batch.get("width")
+        )
+        if height != width:
+            raise ValueError(f"N-Queens requires square boards, got {(height, width)}")
+        if not torch.isin(inputs, torch.tensor((0, 1, 2))).all():
+            raise ValueError("N-Queens inputs must use tokens 0, 1, and 2")
+        if not torch.isin(labels, torch.tensor((1, 2))).all():
+            raise ValueError("N-Queens labels must use tokens 1 (empty) and 2 (queen)")
+
+        batch_size = inputs.shape[0]
+        inputs_grid = inputs.reshape(batch_size, height, width)
+        labels_grid = (labels.reshape(batch_size, height, width) == 2).long()
+        edges, map_u, map_v = V.build_nqueens_multigraph(height)
+        cell_ids = V.build_nqueens_cell_indices(height)
+
+        input_views = V.nqueens_slice_batch_jax(
+            F.one_hot(inputs_grid, num_classes=self.input_num_classes).float()
+        ).permute(1, 0, 2, 3)
+        label_views = V.nqueens_slice_batch_jax(labels_grid[..., None])[..., 0].permute(1, 0, 2)
+        fwd = {
+            "patches": input_views,
+            "edge_indices": edges,
+            "model_kwargs": {
+                "map_u": map_u,
+                "map_v": map_v,
+                "cell_ids": cell_ids,
+            },
+        }
+        targets = {
+            "slice_labels": label_views,
+            "labels_grid": labels_grid,
+            "inputs_grid": inputs_grid,
+        }
+        return fwd, targets, {}
+
+    def loss(self, logits_window, targets):
+        labels = targets["slice_labels"]
+        expanded = labels.unsqueeze(0).expand(logits_window.shape[:-1])
+        return _ce(logits_window, expanded).mean()
+
+    def evaluate(self, logits_final, targets, aux):
+        logits_grid = V.reassemble_nqueens_logits(logits_final.permute(1, 0, 2, 3))
+        predicted = logits_grid.argmax(dim=-1) == 1
+        labels = targets["labels_grid"]
+        clues = targets["inputs_grid"] == 2
+        size = predicted.shape[1]
+
+        rows_valid = (predicted.sum(dim=2) == 1).all(dim=1)
+        columns_valid = (predicted.sum(dim=1) == 1).all(dim=1)
+        diagonals_valid = torch.ones(predicted.shape[0], dtype=torch.bool, device=predicted.device)
+        flipped = predicted.flip(dims=(2,))
+        for offset in range(-(size - 2), size - 1):
+            diagonals_valid &= (
+                torch.diagonal(predicted, offset, dim1=1, dim2=2).sum(dim=-1) <= 1
+            )
+            diagonals_valid &= (
+                torch.diagonal(flipped, offset, dim1=1, dim2=2).sum(dim=-1) <= 1
+            )
+        clues_preserved = (predicted | ~clues).all(dim=(1, 2))
+        valid = rows_valid & columns_valid & diagonals_valid & clues_preserved
+
+        return {
+            "cell_acc": (predicted == labels.bool()).float().mean().item(),
+            "solved": (predicted == labels.bool()).all(dim=(1, 2)).float().mean().item(),
+            "valid": valid.float().mean().item(),
+            "clues_preserved": clues_preserved.float().mean().item(),
+        }
+
+
 def make_task(name: str, **kwargs):
-    tasks = {"maze": MazeTask, "mnist": MNISTTask, "sudoku": SudokuTask}
+    tasks = {
+        "maze": MazeTask,
+        "mnist": MNISTTask,
+        "sudoku": SudokuTask,
+        "n_queens": NQueensTask,
+    }
     if name not in tasks:
         raise KeyError(f"unknown task {name!r}; available: {sorted(tasks)}")
     return tasks[name](**kwargs)

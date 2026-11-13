@@ -1,6 +1,6 @@
 """Hydra training entrypoint for Sheaf-ADMM (and the MPNN baseline).
 
-One entrypoint for every task (maze / mnist / sudoku) and both model families
+One entrypoint for every task (maze / mnist / sudoku / n_queens) and both model families
 (``model_type=sheaf|mpnn``); the task and HPs come entirely from config.
 
     python scripts/train.py +experiment=maze_sheaf

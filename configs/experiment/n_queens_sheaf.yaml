@@ -1,0 +1,44 @@
+# @package _global_
+# Supervised N-Queens baseline using row/column agents and cross-entropy only.
+task: n_queens
+model_type: sheaf
+
+training:
+  lr: 3.0e-4
+  weight_decay: 1.0e-6
+  epochs: 20
+  batch_size: 128
+  K_train: 20
+  K_eval: 40
+  loss_window: 2
+  train_iters_dist: fixed
+  val_interval: 1
+
+data:
+  dir: datasets/n_queens_10x10
+  train_split: train
+  val_splits: [test]
+  loader: puzzle
+
+task_cfg: {}
+
+model:
+  num_classes: 2
+  d_v: 64
+  d_e: 32
+  encoder_arch: mlp
+  enc_hidden_dim: 256
+  comm_norm_type: layernorm
+  objective_mode: non_negative
+  x_solver: diagonal_prox
+  z_solver: unrolled_cg
+  z_mode: prox
+  gamma: 1.0
+  cg_iters: 5
+  rm_sharing: global
+  rm_init: orthonormal
+  rm_mode: fixed
+  rho_init: 0.1
+  decoder_arch: mlp_concat_v2
+  dec_hidden_dim: 256
+  dec_output_shape: [10, 2]
