@@ -148,3 +148,69 @@ def render_mnist_panel(ax, pred, num_classes: int = 10) -> None:
     norm = BoundaryNorm(np.arange(-0.5, num_classes + 0.5, 1.0), num_classes)
     ax.imshow(pred, cmap=_MNIST_CMAP, norm=norm, interpolation="nearest")
     _blank_axis(ax)
+
+
+# =============================================================================
+# N-Queens
+# =============================================================================
+
+
+def nqueens_conflicts(queens: np.ndarray) -> np.ndarray:
+    """Boolean ``[N, N]`` mask of queens sharing a row, column, or diagonal with another."""
+    queens = np.asarray(queens, dtype=bool)
+    rows, cols = np.nonzero(queens)
+    conflict = np.zeros_like(queens)
+    for i in range(len(rows)):
+        for j in range(i + 1, len(rows)):
+            dr, dc = rows[i] - rows[j], cols[i] - cols[j]
+            if dr == 0 or dc == 0 or abs(dr) == abs(dc):
+                conflict[rows[i], cols[i]] = conflict[rows[j], cols[j]] = True
+    return conflict
+
+
+def render_nqueens_panel(ax, clues, pred, solution=None) -> None:
+    """NxN chessboard: given queens black, predicted queens blue.
+
+    ``clues``: ``[N, N]`` bool, queens given in the input. ``pred``: ``[N, N]``
+    bool, predicted queens. ``solution`` (optional): ``[N, N]`` bool ground truth;
+    when given, predicted queens off the solution are drawn red and missed
+    solution queens appear as hollow grey rings. Cells of attacking queens are
+    shaded red.
+    """
+    clues = np.asarray(clues, dtype=bool)
+    pred = np.asarray(pred, dtype=bool)
+    n = pred.shape[0]
+    conflict = nqueens_conflicts(pred)
+
+    checker = (np.add.outer(np.arange(n), np.arange(n)) % 2).astype(float)
+    ax.imshow(
+        np.where(checker == 1, 0.86, 0.97),
+        cmap="gray",
+        vmin=0.0,
+        vmax=1.0,
+        interpolation="nearest",
+        extent=(0, n, n, 0),
+    )
+    for r, c in zip(*np.nonzero(conflict), strict=True):
+        ax.add_patch(plt.Rectangle((c, r), 1, 1, color="#fca5a5", zorder=1))
+
+    fs = max(6, int(110 / n))
+    for r in range(n):
+        for c in range(n):
+            if pred[r, c]:
+                if clues[r, c]:
+                    color, weight = "black", "bold"
+                elif solution is not None and not solution[r, c]:
+                    color, weight = "#dc2626", "normal"
+                else:
+                    color, weight = "#1d4ed8", "normal"
+                ax.text(c + 0.5, r + 0.5, "\u265b", ha="center", va="center",
+                        fontsize=fs, color=color, fontweight=weight, zorder=3)
+            elif solution is not None and solution[r, c]:
+                ax.scatter([c + 0.5], [r + 0.5], s=fs * 6, facecolors="none",
+                           edgecolors="#6b7280", linewidths=1.0, zorder=2)
+
+    ax.set_xlim(0, n)
+    ax.set_ylim(n, 0)
+    ax.set_aspect("equal")
+    _blank_axis(ax)

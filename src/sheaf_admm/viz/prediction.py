@@ -13,6 +13,8 @@ Per task:
 * **Sudoku** — the 9x9 board with given clues (black) and filled digits (blue),
   constraint-violating cells highlighted red.
 * **MNIST** — per-pixel argmax-class consensus as a discrete heatmap.
+* **N-Queens** — the NxN board with given queens (black) and predicted queens
+  (blue), wrong placements red and missed queens as hollow rings.
 """
 
 from __future__ import annotations
@@ -30,6 +32,7 @@ from sheaf_admm.data.common import TOKEN_IDS
 from ._render import (
     render_maze_panel,
     render_mnist_panel,
+    render_nqueens_panel,
     render_sudoku_panel,
     save_figure,
 )
@@ -72,6 +75,15 @@ def _sudoku_predictions(model, params, fwd, ks, batch_index):
         logits = _final_logits(model, params, fwd, k)  # [N, B, 9, 10]
         recon = V.reassemble_sudoku_logits(logits.permute(1, 0, 2, 3))  # [B, 9, 9, 10]
         preds.append(np.argmax(_numpy(recon[batch_index]), axis=-1))
+    return preds
+
+
+def _nqueens_predictions(model, params, fwd, ks, batch_index):
+    preds = []
+    for k in ks:
+        logits = _final_logits(model, params, fwd, k)  # [2N, B, N, 2]
+        recon = V.reassemble_nqueens_logits(logits.permute(1, 0, 2, 3))  # [B, N, N, 2]
+        preds.append(np.argmax(_numpy(recon[batch_index]), axis=-1) == 1)
     return preds
 
 
@@ -149,8 +161,15 @@ def plot_prediction_evolution(
         for ax, k, (_kind, pred) in zip(axes, ks, preds, strict=True):
             render_mnist_panel(ax, pred, num_classes=task.num_classes)
             ax.set_title(f"k = {k}", fontsize=11)
+    elif task_name == "n_queens":
+        preds = _nqueens_predictions(model, params, fwd, ks, batch_index)
+        clues = _numpy(targets["inputs_grid"][batch_index]) == 2
+        solution = _numpy(targets["labels_grid"][batch_index]).astype(bool)
+        for ax, k, pred in zip(axes, ks, preds, strict=True):
+            render_nqueens_panel(ax, clues, pred, solution)
+            ax.set_title(f"k = {k}", fontsize=11)
     else:
-        raise ValueError(f"unknown task name {task_name!r} (maze|sudoku|mnist)")
+        raise ValueError(f"unknown task name {task_name!r} (maze|sudoku|mnist|n_queens)")
 
     if title:
         fig.suptitle(title, fontsize=12)
