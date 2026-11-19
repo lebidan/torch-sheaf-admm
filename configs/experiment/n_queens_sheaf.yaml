@@ -9,13 +9,16 @@
 #   (A single global map made all edges of an agent carry the same message.)
 # * queen_weight: queens are 1/N of the cells; up-weight them in the CE.
 # * perm_decode: also report *_perm metrics (max-score permutation decoding).
+# * augment: dihedral — the 8 board symmetries preserve the N-Queens rules and the
+#   uniqueness of the solution; fights memorizing (clues -> solution) pairs
+#   (10-queens has only 724 solutions). Plus dropout / weight decay.
 task: n_queens
 model_type: sheaf
 
 training:
   lr: 1.0e-3
-  weight_decay: 1.0e-6
-  epochs: 30
+  weight_decay: 1.0e-4
+  epochs: 40
   batch_size: 128
   K_train: 20
   K_eval: 40
@@ -28,6 +31,7 @@ data:
   train_split: train
   val_splits: [test]
   loader: puzzle
+  augment: dihedral
 
 task_cfg:
   diagonals: true
@@ -40,6 +44,7 @@ model:
   d_e: 16
   encoder_arch: mlp
   enc_hidden_dim: 256
+  dropout_rate: 0.1
   comm_norm_type: layernorm
   objective_mode: non_negative
   x_solver: diagonal_prox

@@ -43,6 +43,7 @@ data:
   train_split: train
   val_splits: [test]
   loader: puzzle      # puzzle (maze/sudoku) | image (mnist)
+  augment: none       # none | dihedral (random rotation/flip per training puzzle)
 
 # kwargs forwarded to the task hook (sheaf_admm.training.make_task)
 task_cfg: {}

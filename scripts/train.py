@@ -30,7 +30,7 @@ if str(PROJECT_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 import sheaf_admm as _sheaf_admm  # noqa: F401,E402
-from sheaf_admm.data import ImageDataset, PuzzleDataset  # noqa: E402
+from sheaf_admm.data import ImageDataset, PuzzleDataset, random_dihedral_batch  # noqa: E402
 from sheaf_admm.models import model_config_from_dict  # noqa: E402
 from sheaf_admm.training import (  # noqa: E402
     build_model,
@@ -50,15 +50,33 @@ def _puzzle_batch(batch):
     return out
 
 
+def _augment_puzzle_batch(batch, rng):
+    """Random dihedral symmetry per puzzle (``data.augment: dihedral``)."""
+    seq_len = batch["inputs"].shape[1]
+    height = int(batch.get("height", round(seq_len**0.5)))
+    width = int(batch.get("width", seq_len // height))
+    batch["inputs"], batch["labels"], _ = random_dihedral_batch(
+        rng, batch["inputs"], batch["labels"], height, width
+    )
+    return batch
+
+
 def _train_batches(cfg: DictConfig, epoch: int):
     """Yield ``{inputs/images, labels}`` batches for one training epoch."""
     d = cfg.data
+    augment = str(d.get("augment", "none") or "none")
+    if augment not in ("none", "dihedral"):
+        raise ValueError(f"unknown data.augment={augment!r} (none|dihedral)")
     if d.loader == "puzzle":
         ds = PuzzleDataset(d.dir, d.train_split)
+        aug_rng = np.random.default_rng(cfg.training.seed + 1_000_003 * (epoch + 1))
         for _set, batch in ds.iter_train_batches(
             cfg.training.batch_size, seed=cfg.training.seed + epoch
         ):
-            yield _puzzle_batch(batch)
+            batch = _puzzle_batch(batch)
+            if augment == "dihedral":
+                batch = _augment_puzzle_batch(batch, aug_rng)
+            yield batch
     else:  # image
         ds = ImageDataset(d.dir, d.train_split)
         for batch in ds.iter_batches(

@@ -238,6 +238,37 @@ def test_nqueens_diagonal_task_masks_padding_and_decodes_permutation():
         )
 
 
+def test_random_dihedral_batch_keeps_nqueens_solutions_valid():
+    from sheaf_admm.data import random_dihedral_batch
+
+    size = 10
+    queen_columns = [0, 2, 5, 7, 9, 4, 8, 1, 3, 6]
+    labels = np.ones((size, size), dtype=np.uint8)
+    labels[np.arange(size), queen_columns] = 2
+    inputs = np.ones_like(labels)
+    inputs[[1, 4, 7], [queen_columns[1], queen_columns[4], queen_columns[7]]] = 2
+    batch_in = np.repeat(inputs.reshape(1, -1), 16, axis=0)
+    batch_lab = np.repeat(labels.reshape(1, -1), 16, axis=0)
+
+    rng = np.random.default_rng(0)
+    aug_in, aug_lab, tids = random_dihedral_batch(rng, batch_in, batch_lab, size, size)
+    assert set(tids.tolist()) <= set(range(8)) and len(set(tids.tolist())) > 1
+    for board_in, board_lab in zip(aug_in, aug_lab, strict=True):
+        q = board_lab.reshape(size, size) == 2
+        r, c = np.nonzero(q)
+        assert len(set(r)) == len(set(c)) == size
+        assert len(set(r - c)) == len(set(r + c)) == size
+        # clues move with the solution
+        clue = board_in.reshape(size, size) == 2
+        assert clue.sum() == 3 and (q | ~clue).all()
+
+    # non-square boards only use shape-preserving symmetries
+    _, _, tids = random_dihedral_batch(
+        rng, np.zeros((32, 12), np.int64), np.zeros((32, 12), np.int64), 3, 4
+    )
+    assert set(tids.tolist()) <= {0, 2, 4, 5}
+
+
 def test_maze_wall_border_prepad():
     """``prepare_maze_patches`` one-hots tokens and pads the *border* with the wall
     token, so a boundary agent whose patch runs out of bounds sees walls there
