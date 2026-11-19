@@ -362,62 +362,160 @@ def sudoku_node_positions(num_nodes: int) -> torch.Tensor:
 
 
 # =============================================================================
-# N-Queens views: one agent per row and column
+# N-Queens views: one agent per row and column (+ optional diagonal agents)
 # =============================================================================
+#
+# Agent layout (``A`` agents, each holding a line of ``N`` slots):
+#
+# * rows ``0..N-1`` then columns ``N..2N-1`` (always);
+# * with ``diagonals=True``: ``2N-1`` main diagonals (``c - r`` constant, ordered
+#   by ``c - r + N - 1``) then ``2N-1`` anti-diagonals (``r + c`` constant).
+#   Diagonals shorter than ``N`` are right-padded; padded slots have cell id -1.
+#
+# Row/column-only boards keep the original layout bit-for-bit.
+
+NQUEENS_PAD_CELL = -1
 
 
-def nqueens_slice_batch_jax(batch_grids: torch.Tensor) -> torch.Tensor:
-    """Return row and column views as ``[B, 2N, N, C]`` from ``[B, N, N, C]``."""
+@functools.lru_cache(maxsize=16)
+def _nqueens_layout(grid_size: int, diagonals: bool) -> tuple[np.ndarray, np.ndarray]:
+    """``(cell_ids [A, N], agent_type [A])``; type 0=row, 1=col, 2=diag, 3=anti-diag."""
+    n = int(grid_size)
+    if n <= 0:
+        raise ValueError("grid_size must be positive")
+    cells = np.arange(n * n).reshape(n, n)
+    lines = [cells[r] for r in range(n)] + [cells[:, c] for c in range(n)]
+    types = [0] * n + [1] * n
+    if diagonals:
+        for off in range(-(n - 1), n):
+            lines.append(np.diagonal(cells, offset=off))
+            types.append(2)
+        flipped = cells[:, ::-1]
+        for s in range(2 * n - 1):
+            # anti-diagonal r + c = s, ordered by increasing row
+            lines.append(np.diagonal(flipped, offset=(n - 1) - s))
+            types.append(3)
+    ids = np.full((len(lines), n), NQUEENS_PAD_CELL, dtype=np.int64)
+    for a, line in enumerate(lines):
+        ids[a, : len(line)] = line
+    return ids, np.asarray(types, dtype=np.int64)
+
+
+def nqueens_num_nodes(grid_size: int = 10, diagonals: bool = False) -> int:
+    if grid_size <= 0:
+        raise ValueError("grid_size must be positive")
+    return 2 * grid_size + (2 * (2 * grid_size - 1) if diagonals else 0)
+
+
+def build_nqueens_cell_indices(grid_size: int = 10, diagonals: bool = False) -> torch.Tensor:
+    """Map each agent's local slots to global cell IDs; shape ``[A, N]`` (pad = -1)."""
+    ids, _ = _nqueens_layout(grid_size, diagonals)
+    return torch.as_tensor(ids.copy(), dtype=torch.long)
+
+
+def nqueens_slice_batch_jax(
+    batch_grids: torch.Tensor, *, diagonals: bool = False, pad_value=0
+) -> torch.Tensor:
+    """Return per-agent line views ``[B, A, N, C]`` from ``[B, N, N, C]``.
+
+    Without diagonals, ``A = 2N`` (rows then columns). With diagonals, padded
+    slots of short diagonals are filled with ``pad_value``.
+    """
     grids = torch.as_tensor(batch_grids)
     if grids.ndim != 4 or grids.shape[1] != grids.shape[2]:
         raise ValueError(f"expected square grids of shape (B,N,N,C); got {grids.shape}")
     if grids.shape[1] == 0:
         raise ValueError("N-Queens grids must have a positive size")
-    return torch.cat((grids, grids.transpose(1, 2)), dim=1)
+    if not diagonals:
+        return torch.cat((grids, grids.transpose(1, 2)), dim=1)
+    b, n, _, c = grids.shape
+    ids = torch.as_tensor(_nqueens_layout(n, True)[0], device=grids.device)
+    flat = grids.reshape(b, n * n, c)
+    pad = torch.full((b, 1, c), pad_value, dtype=grids.dtype, device=grids.device)
+    flat = torch.cat((flat, pad), dim=1)  # index n*n is the pad cell
+    gather = torch.where(ids < 0, torch.full_like(ids, n * n), ids)
+    return flat[:, gather.reshape(-1)].reshape(b, ids.shape[0], n, c)
+
+
+def _infer_nqueens_layout(num_agents: int, line_length: int) -> bool:
+    if num_agents == nqueens_num_nodes(line_length, False):
+        return False
+    if num_agents == nqueens_num_nodes(line_length, True):
+        return True
+    raise ValueError(
+        f"expected 2N or 2N+2(2N-1) agents for N={line_length}; got {num_agents}"
+    )
 
 
 def reassemble_nqueens_logits(batch_logits: torch.Tensor) -> torch.Tensor:
-    """Average row/column predictions back to ``[B, N, N, C]``."""
+    """Average every agent's prediction for each cell back to ``[B, N, N, C]``.
+
+    Accepts ``[B, A, N, C]`` with either the row/column layout or the layout with
+    diagonals (detected from ``A``); padded diagonal slots are ignored.
+    """
     logits = torch.as_tensor(batch_logits)
     if logits.ndim != 4:
-        raise ValueError(f"expected logits of shape (B,2N,N,C); got {logits.shape}")
-    num_agents, line_length = logits.shape[1:3]
-    if line_length == 0 or num_agents != 2 * line_length:
-        raise ValueError(f"expected shape (B,2N,N,C); got {logits.shape}")
-    rows = logits[:, :line_length]
-    cols = logits[:, line_length:].transpose(1, 2)
-    return (rows + cols) / 2.0
+        raise ValueError(f"expected logits of shape (B,A,N,C); got {logits.shape}")
+    b, num_agents, n, c = logits.shape
+    if n == 0:
+        raise ValueError(f"expected shape (B,A,N,C); got {logits.shape}")
+    diagonals = _infer_nqueens_layout(num_agents, n)
+    if not diagonals:
+        rows = logits[:, :n]
+        cols = logits[:, n:].transpose(1, 2)
+        return (rows + cols) / 2.0
+    ids = torch.as_tensor(_nqueens_layout(n, True)[0], device=logits.device).reshape(-1)
+    valid = ids >= 0
+    vals = logits.reshape(b, -1, c)[:, valid]
+    out = torch.zeros(b, n * n, c, dtype=logits.dtype, device=logits.device)
+    out.index_add_(1, ids[valid], vals)
+    counts = torch.bincount(ids[valid], minlength=n * n).to(logits.dtype)
+    return (out / counts[None, :, None]).reshape(b, n, n, c)
 
 
 def build_nqueens_multigraph(
-    grid_size: int = 10,
+    grid_size: int = 10, diagonals: bool = False
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Build row/column intersection edges and the matching local cell slots.
+    """Build cell-sharing edges and the matching restriction-map slot of each endpoint.
 
-    Row agents are indexed ``0..N-1`` and column agents ``N..2N-1``.
-    Returns ``(edges, map_u, map_v)`` with one edge for each board cell.
+    Without diagonals: one (row, column) edge per board cell, ordered by cell,
+    with ``map_u``/``map_v`` the cell's position inside the row/column (``0..N-1``).
+
+    With diagonals: every pair of the (up to 4) agents covering a cell gets an
+    edge. Slots are *typed*, ``type * N + position`` (``0..4N-1``), so rows,
+    columns and both diagonal families get their own per-position maps; set
+    ``rm_num_slots = 4N`` in the model config.
     """
-    if grid_size <= 0:
+    n = int(grid_size)
+    if n <= 0:
         raise ValueError("grid_size must be positive")
-    cells = torch.arange(grid_size * grid_size, dtype=torch.long)
-    rows = torch.div(cells, grid_size, rounding_mode="floor")
-    cols = cells % grid_size
-    edges = torch.stack((rows, grid_size + cols), dim=1)
-    return edges, cols, rows
+    if not diagonals:
+        cells = torch.arange(n * n, dtype=torch.long)
+        rows = torch.div(cells, n, rounding_mode="floor")
+        cols = cells % n
+        edges = torch.stack((rows, n + cols), dim=1)
+        return edges, cols, rows
 
-
-def build_nqueens_cell_indices(grid_size: int = 10) -> torch.Tensor:
-    """Map each row/column agent's local slots to global cell IDs; shape ``[2N,N]``."""
-    if grid_size <= 0:
-        raise ValueError("grid_size must be positive")
-    cells = torch.arange(grid_size * grid_size, dtype=torch.long).reshape(grid_size, grid_size)
-    return torch.cat((cells, cells.transpose(0, 1)), dim=0)
-
-
-def nqueens_num_nodes(grid_size: int = 10) -> int:
-    if grid_size <= 0:
-        raise ValueError("grid_size must be positive")
-    return 2 * grid_size
+    ids, types = _nqueens_layout(n, True)
+    covering: list[list[tuple[int, int]]] = [[] for _ in range(n * n)]
+    for a in range(ids.shape[0]):
+        for pos in range(n):
+            cell = ids[a, pos]
+            if cell >= 0:
+                covering[cell].append((a, int(types[a]) * n + pos))
+    edges, map_u, map_v = [], [], []
+    for agents in covering:
+        for i in range(len(agents)):
+            for j in range(i + 1, len(agents)):
+                (u, su), (v, sv) = agents[i], agents[j]
+                edges.append((u, v))
+                map_u.append(su)
+                map_v.append(sv)
+    return (
+        torch.as_tensor(edges, dtype=torch.long),
+        torch.as_tensor(map_u, dtype=torch.long),
+        torch.as_tensor(map_v, dtype=torch.long),
+    )
 
 
 # =============================================================================

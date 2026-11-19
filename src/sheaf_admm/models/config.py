@@ -51,7 +51,8 @@ class ModelConfig:
     gd_momentum: float = 0.9
 
     # --- restriction maps / geometry ---
-    rm_sharing: str = "directional"  # global | directional | sudoku
+    rm_sharing: str = "directional"  # global | directional | sudoku (alias: slot)
+    rm_num_slots: int = 9  # per-slot maps for rm_sharing=sudoku/slot (N-Queens w/ diags: 4N)
     rm_init: str = "orthonormal"  # orthonormal | default | identity | soft_slice (sudoku)
     rm_mode: str = "fixed"  # fixed | context (LoRA)
     lora_rank: int = 4

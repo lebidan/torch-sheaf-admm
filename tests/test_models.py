@@ -179,7 +179,8 @@ def test_nqueens_experiment_forward_shape_without_training():
             compile_steps=False,
         )
 
-    assert logits.shape == (1, 20, 1, 10, 2)
+    num_agents = 20 + (38 if data.get("task_cfg", {}).get("diagonals") else 0)
+    assert logits.shape == (1, num_agents, 1, 10, 2)
     assert torch.isfinite(logits).all()
 
 

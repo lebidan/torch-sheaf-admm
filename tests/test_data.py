@@ -140,6 +140,9 @@ def test_nqueens_task_prepares_loss_and_solution_metrics():
         "solved": 1.0,
         "valid": 1.0,
         "clues_preserved": 1.0,
+        "cell_acc_perm": 1.0,
+        "solved_perm": 1.0,
+        "valid_perm": 1.0,
     }
 
     invalid_grid = targets["labels_grid"].clone()
@@ -151,6 +154,88 @@ def test_nqueens_task_prepares_loss_and_solution_metrics():
     assert metrics["solved"] == 0.0
     assert metrics["valid"] == 0.0
     assert metrics["clues_preserved"] == 1.0
+
+
+def test_nqueens_diagonal_views_graph_and_reassembly():
+    size, batch = 6, 2
+    num_agents = V.nqueens_num_nodes(size, diagonals=True)
+    assert num_agents == 2 * size + 2 * (2 * size - 1)
+
+    cell_ids = V.build_nqueens_cell_indices(size, diagonals=True)
+    assert cell_ids.shape == (num_agents, size)
+    flat = np.asarray(cell_ids).reshape(-1)
+    counts = np.bincount(flat[flat >= 0], minlength=size * size)
+    np.testing.assert_array_equal(counts, np.full(size * size, 4))
+    # main diagonal (c - r = 0) and anti-diagonal (r + c = N-1) are full length
+    main = 2 * size + (size - 1)
+    anti = 2 * size + (2 * size - 1) + (size - 1)
+    np.testing.assert_array_equal(np.asarray(cell_ids[main]), np.arange(size) * (size + 1))
+    np.testing.assert_array_equal(
+        np.asarray(cell_ids[anti]), np.arange(size) * (size - 1) + (size - 1)
+    )
+
+    grids = torch.randn(batch, size, size, 3)
+    views = V.nqueens_slice_batch_jax(grids, diagonals=True, pad_value=0.0)
+    assert views.shape == (batch, num_agents, size, 3)
+    np.testing.assert_allclose(
+        np.asarray(V.reassemble_nqueens_logits(views)), np.asarray(grids), atol=1e-6
+    )
+
+    edges, map_u, map_v = V.build_nqueens_multigraph(size, diagonals=True)
+    assert edges.shape == (6 * size * size, 2)
+    assert int(map_u.max()) < 4 * size and int(map_v.max()) < 4 * size
+    # every edge links two agents that really share a cell at the given slots
+    ids = np.asarray(cell_ids)
+    for (u, v), su, sv in zip(np.asarray(edges), np.asarray(map_u), np.asarray(map_v)):
+        assert ids[u, su % size] == ids[v, sv % size] >= 0
+
+
+def test_nqueens_diagonal_task_masks_padding_and_decodes_permutation():
+    from sheaf_admm.training import make_task
+    from sheaf_admm.training.tasks import max_weight_permutation
+
+    size = 10
+    queen_columns = [0, 2, 5, 7, 9, 4, 8, 1, 3, 6]
+    labels = np.ones((size, size), dtype=np.int64)
+    labels[np.arange(size), queen_columns] = 2
+    inputs = np.ones_like(labels)
+    inputs[3, queen_columns[3]] = 2
+    batch = {"inputs": inputs.reshape(1, -1), "labels": labels.reshape(1, -1)}
+
+    task = make_task("n_queens", diagonals=True, queen_weight=3.0)
+    fwd, targets, aux = task.prepare(batch)
+    num_agents = V.nqueens_num_nodes(size, diagonals=True)
+    assert fwd["patches"].shape == (num_agents, 1, size, 3)
+    pad = targets["slice_labels"] == task.ignore_index
+    assert pad.sum() == num_agents * size - 4 * size * size
+    # padded slots see input token 0
+    assert (fwd["patches"][..., 0][pad] == 1).all()
+
+    logits = torch.randn(2, num_agents, 1, size, 2)
+    loss = task.loss(logits, targets)
+    assert torch.isfinite(loss)
+
+    # perfect per-cell logits -> everything solved, through both decoders
+    good = torch.where(targets["slice_labels"] == 1, 8.0, -8.0)
+    good_logits = torch.stack((-good, good), dim=-1)
+    metrics = task.evaluate(good_logits, targets, aux)
+    assert metrics["solved"] == 1.0 and metrics["solved_perm"] == 1.0
+
+    w = torch.randn(4, 7, 7)
+    cols = max_weight_permutation(w)
+    import itertools
+
+    for i in range(4):
+        best = max(
+            itertools.permutations(range(7)),
+            key=lambda p, i=i: sum(float(w[i, r, p[r]]) for r in range(7)),
+        )
+        assert sorted(cols[i].tolist()) == list(range(7))
+        np.testing.assert_allclose(
+            float(w[i, torch.arange(7), cols[i]].sum()),
+            sum(float(w[i, r, best[r]]) for r in range(7)),
+            rtol=1e-5,
+        )
 
 
 def test_maze_wall_border_prepad():

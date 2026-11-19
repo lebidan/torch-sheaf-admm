@@ -62,8 +62,8 @@ class SheafADMMModel(nn.Module):
             self.rm = DirectionalRestrictionMaps(c.d_v, c.d_e, c.rm_init, c.num_directions)
         elif c.rm_sharing == "global":
             self.rm = SharedRestrictionMap(c.d_v, c.d_e, c.rm_init)
-        elif c.rm_sharing == "sudoku":
-            self.rm = SudokuRestrictionMaps(c.d_v, c.d_e, c.rm_init)
+        elif c.rm_sharing in ("sudoku", "slot"):
+            self.rm = SudokuRestrictionMaps(c.d_v, c.d_e, c.rm_init, c.rm_num_slots)
         else:
             raise ValueError(f"unknown rm_sharing={c.rm_sharing!r}")
         self.rho_raw = nn.Parameter(torch.zeros(()), requires_grad=c.rho_learnable)
@@ -145,7 +145,7 @@ class SheafADMMModel(nn.Module):
         if c.rm_mode == "fixed":
             return FixedGeometry(edge_indices=edge_indices, restriction_maps=base)
         A, B, gate = enc_out["A"], enc_out["B"], enc_out.get("gate")
-        if c.rm_sharing == "sudoku":
+        if c.rm_sharing in ("sudoku", "slot"):
             return create_sudoku_lora_geometry(
                 edge_indices, map_u, map_v, base, A, B, c.lora_alpha, gate=gate
             )

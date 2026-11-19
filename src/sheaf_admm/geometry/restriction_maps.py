@@ -76,19 +76,34 @@ def make_rm_initializer(init_method: str, d_e: int, d_v: int) -> Initializer:
     return init
 
 
-def make_sudoku_rm_initializer(init_method: str, d_e: int, d_v: int) -> Initializer:
-    if init_method == "soft_slice" and 9 * d_e > d_v:
-        raise ValueError(f"soft_slice needs 9*d_e <= d_v (got 9*{d_e}={9 * d_e} > {d_v})")
+def make_sudoku_rm_initializer(
+    init_method: str, d_e: int, d_v: int, num_slots: int = 9
+) -> Initializer:
+    """Per-slot restriction maps ``[num_slots, d_e, d_v]``.
+
+    ``soft_slice`` makes slot ``k`` select the ``(k mod (d_v // d_e))``-th
+    ``d_e``-wide block of the vertex stalk (plus small noise). For Sudoku
+    (9 slots, ``d_v = 9 * d_e``) this is the original block selector; for typed
+    N-Queens slots (``type * N + pos``, ``d_v = N * d_e``) every agent type maps
+    line position ``pos`` onto block ``pos``.
+    """
+    if init_method == "soft_slice":
+        if d_e > d_v:
+            raise ValueError(f"soft_slice needs d_e <= d_v (got d_e={d_e} > d_v={d_v})")
+        if num_slots == 9 and 9 * d_e > d_v:
+            raise ValueError(f"soft_slice needs 9*d_e <= d_v (got 9*{d_e}={9 * d_e} > {d_v})")
 
     def init(_key, shape, dtype=torch.float32):
-        if shape != (9, d_e, d_v):
-            raise ValueError(f"Sudoku map shape must be {(9, d_e, d_v)}, got {shape}")
+        if shape != (num_slots, d_e, d_v):
+            raise ValueError(f"slot map shape must be {(num_slots, d_e, d_v)}, got {shape}")
         if init_method == "soft_slice":
+            blocks = d_v // d_e
             mats = 0.01 * torch.randn(shape, dtype=dtype)
-            for k in range(9):
-                mats[k, :, k * d_e : (k + 1) * d_e] += torch.eye(d_e, dtype=dtype)
+            for k in range(num_slots):
+                b = k % blocks
+                mats[k, :, b * d_e : (b + 1) * d_e] += torch.eye(d_e, dtype=dtype)
             return mats
-        return torch.stack([_init_one(init_method, d_e, d_v, dtype) for _ in range(9)])
+        return torch.stack([_init_one(init_method, d_e, d_v, dtype) for _ in range(num_slots)])
 
     return init
 
@@ -131,11 +146,17 @@ class SharedRestrictionMap(nn.Module):
 
 
 class SudokuRestrictionMaps(nn.Module):
-    def __init__(self, stalk_dim: int, edge_stalk_dim: int, init_method: str = "soft_slice"):
+    def __init__(
+        self,
+        stalk_dim: int,
+        edge_stalk_dim: int,
+        init_method: str = "soft_slice",
+        num_slots: int = 9,
+    ):
         super().__init__()
         self.R_indices = nn.Parameter(
-            make_sudoku_rm_initializer(init_method, edge_stalk_dim, stalk_dim)(
-                None, (9, edge_stalk_dim, stalk_dim)
+            make_sudoku_rm_initializer(init_method, edge_stalk_dim, stalk_dim, num_slots)(
+                None, (num_slots, edge_stalk_dim, stalk_dim)
             )
         )
 

@@ -145,9 +145,92 @@ class SudokuTask:
         }
 
 
+def _nqueens_board_metrics(predicted, labels, clues):
+    """Row/column/diagonal validity, clue preservation and exact-match for ``[B, N, N]`` bools."""
+    size = predicted.shape[1]
+    rows_valid = (predicted.sum(dim=2) == 1).all(dim=1)
+    columns_valid = (predicted.sum(dim=1) == 1).all(dim=1)
+    diagonals_valid = torch.ones(predicted.shape[0], dtype=torch.bool, device=predicted.device)
+    flipped = predicted.flip(dims=(2,))
+    for offset in range(-(size - 2), size - 1):
+        diagonals_valid &= torch.diagonal(predicted, offset, dim1=1, dim2=2).sum(dim=-1) <= 1
+        diagonals_valid &= torch.diagonal(flipped, offset, dim1=1, dim2=2).sum(dim=-1) <= 1
+    clues_preserved = (predicted | ~clues).all(dim=(1, 2))
+    valid = rows_valid & columns_valid & diagonals_valid & clues_preserved
+    correct = predicted == labels
+    return {
+        "cell_acc": correct.float().mean().item(),
+        "solved": correct.all(dim=(1, 2)).float().mean().item(),
+        "valid": valid.float().mean().item(),
+        "clues_preserved": clues_preserved.float().mean().item(),
+    }
+
+
+def max_weight_permutation(weights: torch.Tensor) -> torch.Tensor:
+    """Exact max-weight row->column assignment for ``[B, N, N]`` scores (bitmask DP).
+
+    Returns ``[B, N]`` long: the chosen column of each row. Cost is
+    ``O(N^2 * 2^N)`` per board, fine up to N ~ 14.
+    """
+    b, n, _ = weights.shape
+    if n > 16:
+        raise ValueError(f"bitmask permutation decoding supports N <= 16, got {n}")
+    device = weights.device
+    weights = weights.float()
+    full = 1 << n
+    masks = torch.arange(full, device=device)
+    popcount = torch.zeros(full, dtype=torch.long, device=device)
+    for c in range(n):
+        popcount += (masks >> c) & 1
+    neg_inf = torch.finfo(torch.float32).min
+    dp = torch.full((b, full), neg_inf, device=device)
+    dp[:, 0] = 0.0
+    choices = []
+    for r in range(n):
+        new = torch.full((b, full), neg_inf, device=device)
+        choice = torch.zeros((b, full), dtype=torch.long, device=device)
+        for c in range(n):
+            bit = 1 << c
+            src = masks[((masks & bit) == 0) & (popcount == r)]
+            dst = src | bit
+            cand = dp[:, src] + weights[:, r, c, None]
+            better = cand > new[:, dst]
+            new[:, dst] = torch.where(better, cand, new[:, dst])
+            choice[:, dst] = torch.where(better, torch.full_like(choice[:, dst], c), choice[:, dst])
+        dp = new
+        choices.append(choice)
+    cols = torch.zeros((b, n), dtype=torch.long, device=device)
+    mask = torch.full((b,), full - 1, dtype=torch.long, device=device)
+    for r in range(n - 1, -1, -1):
+        c = choices[r].gather(1, mask[:, None])[:, 0]
+        cols[:, r] = c
+        mask = mask ^ torch.bitwise_left_shift(torch.ones_like(c), c)
+    return cols
+
+
 class NQueensTask:
+    """N-Queens with line agents.
+
+    * ``diagonals`` — add one agent per main and anti diagonal (2(2N-1) extra
+      agents, padded to length N with input token 0 and ignored in the loss), so
+      the diagonal constraint is represented in the sheaf. Requires
+      ``rm_sharing: sudoku`` with ``rm_num_slots: 4N`` (typed per-slot maps).
+    * ``queen_weight`` — cross-entropy weight on the queen class (~N-1 for
+      balanced rows; queens are 1/N of the cells).
+    * ``perm_decode`` — also report ``*_perm`` metrics where the board is decoded
+      as the max-score permutation (exactly one queen per row and column, given
+      queens forced). Diagonals and the clue-implied solution are *not* imposed,
+      so a correct ``*_perm`` still reflects what the model learned.
+    """
+
     name = "n_queens"
     input_num_classes = 3
+    ignore_index = -100
+
+    def __init__(self, *, diagonals=False, queen_weight=1.0, perm_decode=True):
+        self.diagonals = bool(diagonals)
+        self.queen_weight = float(queen_weight)
+        self.perm_decode = bool(perm_decode)
 
     def prepare(self, batch):
         inputs = torch.as_tensor(batch["inputs"], dtype=torch.long)
@@ -168,13 +251,18 @@ class NQueensTask:
         batch_size = inputs.shape[0]
         inputs_grid = inputs.reshape(batch_size, height, width)
         labels_grid = (labels.reshape(batch_size, height, width) == 2).long()
-        edges, map_u, map_v = V.build_nqueens_multigraph(height)
-        cell_ids = V.build_nqueens_cell_indices(height)
+        edges, map_u, map_v = V.build_nqueens_multigraph(height, diagonals=self.diagonals)
+        cell_ids = V.build_nqueens_cell_indices(height, diagonals=self.diagonals)
 
-        input_views = V.nqueens_slice_batch_jax(
-            F.one_hot(inputs_grid, num_classes=self.input_num_classes).float()
-        ).permute(1, 0, 2, 3)
-        label_views = V.nqueens_slice_batch_jax(labels_grid[..., None])[..., 0].permute(1, 0, 2)
+        # Slice the integer grid first so padded diagonal slots get input token 0.
+        input_tokens = V.nqueens_slice_batch_jax(
+            inputs_grid[..., None], diagonals=self.diagonals, pad_value=0
+        )[..., 0]
+        input_views = F.one_hot(input_tokens, num_classes=self.input_num_classes).float()
+        input_views = input_views.permute(1, 0, 2, 3)
+        label_views = V.nqueens_slice_batch_jax(
+            labels_grid[..., None], diagonals=self.diagonals, pad_value=self.ignore_index
+        )[..., 0].permute(1, 0, 2)
         fwd = {
             "patches": input_views,
             "edge_indices": edges,
@@ -194,35 +282,33 @@ class NQueensTask:
     def loss(self, logits_window, targets):
         labels = targets["slice_labels"]
         expanded = labels.unsqueeze(0).expand(logits_window.shape[:-1])
-        return _ce(logits_window, expanded).mean()
+        weight = None
+        if self.queen_weight != 1.0:
+            weight = torch.tensor(
+                [1.0, self.queen_weight], dtype=logits_window.dtype, device=logits_window.device
+            )
+        return F.cross_entropy(
+            logits_window.reshape(-1, logits_window.shape[-1]),
+            expanded.reshape(-1).long(),
+            weight=weight,
+            ignore_index=self.ignore_index,
+        )
 
     def evaluate(self, logits_final, targets, aux):
         logits_grid = V.reassemble_nqueens_logits(logits_final.permute(1, 0, 2, 3))
-        predicted = logits_grid.argmax(dim=-1) == 1
-        labels = targets["labels_grid"]
+        labels = targets["labels_grid"].bool()
         clues = targets["inputs_grid"] == 2
-        size = predicted.shape[1]
-
-        rows_valid = (predicted.sum(dim=2) == 1).all(dim=1)
-        columns_valid = (predicted.sum(dim=1) == 1).all(dim=1)
-        diagonals_valid = torch.ones(predicted.shape[0], dtype=torch.bool, device=predicted.device)
-        flipped = predicted.flip(dims=(2,))
-        for offset in range(-(size - 2), size - 1):
-            diagonals_valid &= (
-                torch.diagonal(predicted, offset, dim1=1, dim2=2).sum(dim=-1) <= 1
-            )
-            diagonals_valid &= (
-                torch.diagonal(flipped, offset, dim1=1, dim2=2).sum(dim=-1) <= 1
-            )
-        clues_preserved = (predicted | ~clues).all(dim=(1, 2))
-        valid = rows_valid & columns_valid & diagonals_valid & clues_preserved
-
-        return {
-            "cell_acc": (predicted == labels.bool()).float().mean().item(),
-            "solved": (predicted == labels.bool()).all(dim=(1, 2)).float().mean().item(),
-            "valid": valid.float().mean().item(),
-            "clues_preserved": clues_preserved.float().mean().item(),
-        }
+        metrics = _nqueens_board_metrics(logits_grid.argmax(dim=-1) == 1, labels, clues)
+        if self.perm_decode:
+            score = logits_grid[..., 1] - logits_grid[..., 0]
+            score = torch.where(clues, torch.full_like(score, 1e4), score)
+            cols = max_weight_permutation(score)
+            perm = torch.zeros_like(clues)
+            perm.scatter_(2, cols[..., None], True)
+            perm_metrics = _nqueens_board_metrics(perm, labels, clues)
+            for key in ("cell_acc", "solved", "valid"):
+                metrics[f"{key}_perm"] = perm_metrics[key]
+        return metrics
 
 
 def make_task(name: str, **kwargs):
