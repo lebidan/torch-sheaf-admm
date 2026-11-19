@@ -40,6 +40,7 @@ from sheaf_admm.training import (  # noqa: E402
     make_train_step,
     sample_k,
 )
+from sheaf_admm.training.optim import make_schedule  # noqa: E402
 
 
 def _puzzle_batch(batch):
@@ -83,6 +84,22 @@ def _train_batches(cfg: DictConfig, epoch: int):
             cfg.training.batch_size, shuffle=True, seed=cfg.training.seed + epoch
         ):
             yield {"images": np.asarray(batch["images"]), "labels": np.asarray(batch["labels"])}
+
+
+def _save_checkpoint(state, cfg: DictConfig, path: Path) -> None:
+    torch.save(
+        {
+            "format_version": 1,
+            "model_state": {k: v.detach().cpu() for k, v in state.model.state_dict().items()},
+            "ema_state": None
+            if state.ema_params is None
+            else {k: v.detach().cpu() for k, v in state.ema_params.items()},
+            "optimizer_state": state.optimizer.state_dict(),
+            "step": state.step,
+            "config": OmegaConf.to_container(cfg, resolve=True),
+        },
+        path,
+    )
 
 
 def _val_batches(cfg: DictConfig, split: str):
@@ -133,6 +150,17 @@ def main(cfg: DictConfig) -> None:
         seed=cfg.training.seed,
         device=device,
     )
+    lr_kind = str(t.get("lr_schedule", "constant") or "constant")
+    if lr_kind != "constant":
+        steps_per_epoch = sum(1 for _ in _train_batches(cfg, 0))
+        state.lr_schedule = make_schedule(
+            t.lr,
+            t.warmup_steps,
+            kind=lr_kind,
+            total_steps=steps_per_epoch * t.epochs,
+            min_lr_ratio=float(t.get("min_lr_ratio", 0.0)),
+        )
+        print(f"[init] lr_schedule={lr_kind} over {steps_per_epoch * t.epochs} steps")
     run.summary["params"] = sum(x.numel() for x in state.model.parameters())
     print(f"[init] model_type={cfg.model_type} params={run.summary['params']:,}")
 
@@ -141,6 +169,11 @@ def main(cfg: DictConfig) -> None:
     history: list[dict] = []
     best: dict[str, float] = {}
     step = 0
+    out = Path(HydraConfig.get().runtime.output_dir)
+    # ``training.best_metric`` (e.g. ``solved_perm``): keep ``checkpoint_best.pt`` for
+    # the epoch with the highest value of that metric on the first validation split.
+    best_metric = t.get("best_metric")
+    best_value = -float("inf")
 
     for epoch in range(t.epochs):
         for batch in _train_batches(cfg, epoch):
@@ -182,21 +215,21 @@ def main(cfg: DictConfig) -> None:
                 )
             history.append(row)
             run.summary.update(best)
+            if best_metric:
+                first = row[cfg.data.val_splits[0]]
+                if best_metric not in first:
+                    raise KeyError(
+                        f"training.best_metric={best_metric!r} not in metrics {sorted(first)}"
+                    )
+                if first[best_metric] > best_value:
+                    best_value = first[best_metric]
+                    _save_checkpoint(state, cfg, out / "checkpoint_best.pt")
+                    print(
+                        f"[epoch {epoch}] new best {best_metric}={best_value * 100:.2f}% "
+                        "-> checkpoint_best.pt"
+                    )
 
-    out = Path(HydraConfig.get().runtime.output_dir)
-    torch.save(
-        {
-            "format_version": 1,
-            "model_state": {k: v.detach().cpu() for k, v in state.model.state_dict().items()},
-            "ema_state": None
-            if state.ema_params is None
-            else {k: v.detach().cpu() for k, v in state.ema_params.items()},
-            "optimizer_state": state.optimizer.state_dict(),
-            "step": state.step,
-            "config": OmegaConf.to_container(cfg, resolve=True),
-        },
-        out / "checkpoint.pt",
-    )
+    _save_checkpoint(state, cfg, out / "checkpoint.pt")
     (out / "history.json").write_text(json.dumps(history, indent=2))
     print(f"[done] saved checkpoint + history to {out}")
     run.finish()

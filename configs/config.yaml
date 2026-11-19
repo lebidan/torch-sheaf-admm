@@ -21,11 +21,14 @@ training:
   weight_decay: 1.0e-6
   epochs: 50
   batch_size: 128
-  warmup_steps: 200   # linear warmup -> constant LR
+  warmup_steps: 200   # linear warmup -> constant LR (or cosine decay, see lr_schedule)
+  lr_schedule: constant   # constant | cosine (decay to min_lr_ratio * lr by the last epoch)
+  min_lr_ratio: 0.0
   grad_clip: 1.0      # global-norm clip
   ema_decay: 0.999    # EMA of params, used at eval
   exit_on_nan: true
   val_interval: 5
+  best_metric: null   # e.g. solved_perm: also keep checkpoint_best.pt (first val split)
 
   # ADMM horizon (Sheaf): K_train iterations at train, K_eval at eval.
   K_train: 40
