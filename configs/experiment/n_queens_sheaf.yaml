@@ -15,6 +15,8 @@
 # * K_train/K_eval 40/80: more ADMM rounds to propagate constraints; 80 epochs
 #   (run 2 was still improving at epoch 39); checkpoint_best.pt on solved_perm;
 #   cosine LR decay to 5% of lr to consolidate the end of training.
+# * batch_size 64: K_train=40 keeps twice the ADMM activations for backprop;
+#   batch 128 runs out of memory on a 12 GB GPU.
 task: n_queens
 model_type: sheaf
 
@@ -24,7 +26,7 @@ training:
   epochs: 80
   lr_schedule: cosine
   min_lr_ratio: 0.05
-  batch_size: 128
+  batch_size: 64
   K_train: 40
   K_eval: 80
   loss_window: 2
