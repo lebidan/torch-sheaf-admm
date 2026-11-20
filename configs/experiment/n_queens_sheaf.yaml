@@ -17,6 +17,9 @@
 #   cosine LR decay to 5% of lr to consolidate the end of training.
 # * batch_size 64: K_train=40 keeps twice the ADMM activations for backprop;
 #   batch 128 runs out of memory on a 12 GB GPU.
+# * data.dir: symmetry-disjoint split (build_N_Queens_orbits). In the HF split every
+#   test puzzle is a rotation/reflection of a train puzzle, which dihedral
+#   augmentation leaks into training. Old split: data.dir=datasets/n_queens_10x10
 task: n_queens
 model_type: sheaf
 
@@ -35,7 +38,7 @@ training:
   best_metric: solved_perm
 
 data:
-  dir: datasets/n_queens_10x10
+  dir: datasets/n_queens_10x10_orbits
   train_split: train
   val_splits: [test]
   loader: puzzle
