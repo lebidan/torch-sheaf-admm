@@ -33,6 +33,13 @@ Usage:
     python -m sheaf_admm.data.build_minesweeper                       # 9x9, 10 mines
     python -m sheaf_admm.data.build_minesweeper --size 6 --mines 5    # 6x6, 5 mines
 
+Test-only sets for size generalisation (same mine density as 6x6 / 5 mines):
+    python -m sheaf_admm.data.build_minesweeper --size 9 --mines 11 --train-size 0 \
+        --output-dir datasets/minesweeper_ood_9x9
+    python -m sheaf_admm.data.build_minesweeper --size 12 --mines 20 --train-size 0 \
+        --output-dir datasets/minesweeper_ood_12x12
+(give an explicit --output-dir: the default would overwrite datasets/minesweeper_9x9)
+
 Small boards have few distinct puzzles: 4x4 already repeats about half of its
 boards after 30k draws (risk of memorisation), 6x6 with 5 mines does not.
 """
@@ -331,7 +338,8 @@ def build(cfg: MinesweeperConfig) -> None:
     perm = np.random.default_rng(cfg.seed + 1).permutation(len(inputs))
     test_idx, train_idx = perm[: cfg.test_size], perm[cfg.test_size :]
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
-    _write_split(cfg.output_dir, "train", inputs[train_idx], labels[train_idx], cfg.size)
+    if cfg.train_size > 0:  # --train-size 0: test set only (e.g. larger boards for OOD tests)
+        _write_split(cfg.output_dir, "train", inputs[train_idx], labels[train_idx], cfg.size)
     _write_split(cfg.output_dir, "test", inputs[test_idx], labels[test_idx], cfg.size)
     (cfg.output_dir / "config.json").write_text(json.dumps(cfg.to_dict(), indent=2))
     print(f"Done. Dataset saved to {cfg.output_dir}")
