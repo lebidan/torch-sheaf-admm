@@ -311,12 +311,127 @@ class NQueensTask:
         return metrics
 
 
+class MinesweeperTask:
+    """Minesweeper with overlapping ``patch x patch`` agents.
+
+    Inputs come from :mod:`sheaf_admm.data.build_minesweeper`: token 1 = hidden
+    cell, ``2 + n`` = revealed cell showing ``n``; labels 1 = safe, 2 = mine.
+    Every agent predicts mine / safe for its cells; predictions of the agents
+    sharing a cell are averaged.
+
+    * ``patch_size`` / ``stride`` — agent layout (5 / 2: 9 agents on 9x9);
+      every 3x3 neighbourhood must fit inside one agent (checked).
+    * ``mine_weight`` — cross-entropy weight of the mine class.
+    * ``mask_revealed`` — revealed cells are safe by definition; leave them out
+      of the loss and of the metrics (they would inflate the accuracy).
+    * ``topk_decode`` — also report ``*_topk`` metrics: the ``m`` hidden cells
+      with the highest mine score are mines, ``m`` being the board's mine count
+      (the player knows it). It plays the role of N-Queens' ``*_perm``.
+    """
+
+    name = "minesweeper"
+    input_num_classes = 11
+    ignore_index = -100
+
+    def __init__(
+        self, *, patch_size=5, stride=2, mine_weight=1.0, mask_revealed=True, topk_decode=True
+    ):
+        self.patch_size = int(patch_size)
+        self.stride = int(stride)
+        self.mine_weight = float(mine_weight)
+        self.mask_revealed = bool(mask_revealed)
+        self.topk_decode = bool(topk_decode)
+
+    def prepare(self, batch):
+        inputs = torch.as_tensor(batch["inputs"], dtype=torch.long)
+        labels = torch.as_tensor(batch["labels"], dtype=torch.long)
+        if inputs.ndim != 2 or labels.shape != inputs.shape:
+            raise ValueError("Minesweeper inputs and labels must have the same [B, S*S] shape")
+        height, width = V.infer_image_hw(inputs.shape[1], batch.get("height"), batch.get("width"))
+        if height != width:
+            raise ValueError(f"Minesweeper requires square boards, got {(height, width)}")
+        if inputs.min() < 1 or inputs.max() >= self.input_num_classes:
+            raise ValueError("Minesweeper inputs must use tokens 1 (hidden) and 2..10 (numbers)")
+        if not torch.isin(labels, torch.tensor((1, 2))).all():
+            raise ValueError("Minesweeper labels must use tokens 1 (safe) and 2 (mine)")
+
+        cell_ids, edges, map_u, map_v = V.build_minesweeper_graph(
+            height, self.patch_size, self.stride
+        )
+        hidden = inputs == 1
+        mines = (labels == 2).long()
+        target = mines.masked_fill(~hidden, self.ignore_index) if self.mask_revealed else mines
+
+        input_views = F.one_hot(
+            V.minesweeper_slice_batch(inputs, cell_ids), num_classes=self.input_num_classes
+        ).float()
+        fwd = {
+            "patches": input_views.permute(1, 0, 2, 3),  # [A, B, L, C]
+            "edge_indices": edges,
+            "model_kwargs": {"map_u": map_u, "map_v": map_v, "cell_ids": cell_ids},
+        }
+        targets = {
+            "slice_labels": V.minesweeper_slice_batch(target, cell_ids).permute(1, 0, 2),
+            "mines": mines.bool(),
+            "hidden": hidden,
+            "cell_ids": cell_ids,
+        }
+        return fwd, targets, {}
+
+    def loss(self, logits_window, targets):
+        labels = targets["slice_labels"]
+        expanded = labels.unsqueeze(0).expand(logits_window.shape[:-1])
+        weight = None
+        if self.mine_weight != 1.0:
+            weight = torch.tensor(
+                [1.0, self.mine_weight], dtype=logits_window.dtype, device=logits_window.device
+            )
+        return F.cross_entropy(
+            logits_window.reshape(-1, logits_window.shape[-1]),
+            expanded.reshape(-1).long(),
+            weight=weight,
+            ignore_index=self.ignore_index,
+        )
+
+    @staticmethod
+    def _board_metrics(predicted, mines, scored):
+        correct = (predicted == mines) | ~scored
+        return {
+            "cell_acc": ((predicted == mines) & scored).sum().item() / max(scored.sum().item(), 1),
+            "solved": correct.all(dim=1).float().mean().item(),
+        }
+
+    def evaluate(self, logits_final, targets, aux):
+        logits = V.reassemble_minesweeper_logits(
+            logits_final.permute(1, 0, 2, 3), targets["cell_ids"]
+        )
+        mines, hidden = targets["mines"], targets["hidden"]
+        scored = hidden if self.mask_revealed else torch.ones_like(hidden)
+        predicted = (logits.argmax(dim=-1) == 1) & hidden  # revealed cells are safe
+        metrics = self._board_metrics(predicted, mines, scored)
+        mine_cells = mines & scored
+        metrics["mine_recall"] = (predicted & mine_cells).sum().item() / max(
+            mine_cells.sum().item(), 1
+        )
+        if self.topk_decode:
+            score = (logits[..., 1] - logits[..., 0]).masked_fill(~hidden, float("-inf"))
+            order = score.argsort(dim=1, descending=True)
+            rank = torch.empty_like(order)
+            positions = torch.arange(order.shape[1], device=order.device).repeat(order.shape[0], 1)
+            rank.scatter_(1, order, positions)
+            topk = (rank < mines.sum(dim=1, keepdim=True)) & hidden
+            for key, value in self._board_metrics(topk, mines, scored).items():
+                metrics[f"{key}_topk"] = value
+        return metrics
+
+
 def make_task(name: str, **kwargs):
     tasks = {
         "maze": MazeTask,
         "mnist": MNISTTask,
         "sudoku": SudokuTask,
         "n_queens": NQueensTask,
+        "minesweeper": MinesweeperTask,
     }
     if name not in tasks:
         raise KeyError(f"unknown task {name!r}; available: {sorted(tasks)}")

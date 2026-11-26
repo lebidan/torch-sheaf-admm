@@ -1,0 +1,67 @@
+# @package _global_
+# Sheaf-ADMM Minesweeper 9x9 / 10 mines, uniquely solvable boards
+# (python -m sheaf_admm.data.build_minesweeper).
+#
+# * Agents: 5x5 patches every 2 cells -> 9 agents, 308 shared-cell edges. Every
+#   3x3 neighbourhood of a number fits inside one agent (checked by the task).
+# * rm_sharing sudoku + rm_num_slots 25: one restriction map per position inside
+#   the patch; soft_slice makes position k read block k of the agent state, so
+#   d_v = 25 blocks x d_e.
+# * mine_weight: mines are ~20% of the hidden cells (10 of ~50).
+# * Loss and metrics only on hidden cells (revealed cells are safe by definition).
+# * *_topk metrics: the m highest-scoring hidden cells are mines (m = mine count).
+# * K random in [10, 20] (robust to the iteration count), evaluated at K = 20.
+task: minesweeper
+model_type: sheaf
+
+training:
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  epochs: 30
+  lr_schedule: cosine
+  min_lr_ratio: 0.05
+  batch_size: 128
+  K_train: 20
+  train_iters_dist: uniform
+  train_iters_min: 10
+  K_eval: 20
+  loss_window: 2
+  val_interval: 1
+  best_metric: solved_topk
+
+data:
+  dir: datasets/minesweeper_9x9
+  train_split: train
+  val_splits: [test]
+  loader: puzzle
+  augment: dihedral
+
+task_cfg:
+  patch_size: 5
+  stride: 2
+  mine_weight: 2.0
+  mask_revealed: true
+  topk_decode: true
+
+model:
+  num_classes: 2
+  d_v: 200               # 25 cell positions x 8-dim blocks
+  d_e: 8
+  encoder_arch: mlp
+  enc_hidden_dim: 256
+  dropout_rate: 0.1
+  comm_norm_type: layernorm
+  objective_mode: non_negative
+  x_solver: diagonal_prox
+  z_solver: unrolled_cg
+  z_mode: prox
+  gamma: 2.0
+  cg_iters: 5
+  rm_sharing: sudoku     # per-slot maps (alias: slot)
+  rm_num_slots: 25       # one per cell position in a 5x5 patch
+  rm_init: soft_slice
+  rm_mode: fixed
+  rho_init: 0.25
+  decoder_arch: mlp_concat_v2
+  dec_hidden_dim: 256
+  dec_output_shape: [25, 2]

@@ -519,6 +519,107 @@ def build_nqueens_multigraph(
 
 
 # =============================================================================
+# Minesweeper views: overlapping square patches of cells
+# =============================================================================
+#
+# Agent ``a`` owns a ``patch x patch`` block of cells whose top-left corners sit
+# every ``stride`` cells (the last block is shifted to touch the border). Every
+# cell shared by two agents gives one edge, with the cell's position inside each
+# patch as restriction-map slot (``0 .. patch*patch - 1``).
+#
+# A revealed number constrains its 3x3 neighbourhood, so every 3x3 window of the
+# board must lie inside at least one agent; otherwise no agent sees the whole
+# constraint. The layout builder checks this. On a 9x9 board, 5x5 patches with
+# stride 2 give 9 agents and satisfy it; 3x3 patches with stride 2 do not.
+
+
+def _patch_starts(size: int, patch: int, stride: int) -> list[int]:
+    if not 0 < patch <= size:
+        raise ValueError(f"patch size must be in [1, {size}], got {patch}")
+    if stride <= 0:
+        raise ValueError("stride must be positive")
+    starts = list(range(0, size - patch + 1, stride))
+    if starts[-1] != size - patch:
+        starts.append(size - patch)
+    return starts
+
+
+@functools.lru_cache(maxsize=16)
+def _minesweeper_layout(size: int, patch: int, stride: int):
+    """``(cell_ids [A, patch*patch], edges [E, 2], map_u [E], map_v [E])`` as numpy arrays."""
+    starts = _patch_starts(size, patch, stride)
+    ids = np.asarray(
+        [
+            [(r0 + i) * size + (c0 + j) for i in range(patch) for j in range(patch)]
+            for r0 in starts
+            for c0 in starts
+        ],
+        dtype=np.int64,
+    )
+    window = min(3, size)
+    for r in range(size - window + 1):
+        for c in range(size - window + 1):
+            if not any(r0 <= r and r + window <= r0 + patch for r0 in starts) or not any(
+                c0 <= c and c + window <= c0 + patch for c0 in starts
+            ):
+                raise ValueError(
+                    f"patch={patch}, stride={stride} splits the 3x3 neighbourhood at "
+                    f"({r + 1}, {c + 1}) across agents; use larger patches or a smaller stride"
+                )
+    covering: list[list[tuple[int, int]]] = [[] for _ in range(size * size)]
+    for a in range(ids.shape[0]):
+        for slot, cell in enumerate(ids[a]):
+            covering[cell].append((a, slot))
+    edges, map_u, map_v = [], [], []
+    for agents in covering:
+        for i in range(len(agents)):
+            for j in range(i + 1, len(agents)):
+                (u, su), (v, sv) = agents[i], agents[j]
+                edges.append((u, v))
+                map_u.append(su)
+                map_v.append(sv)
+    return (
+        ids,
+        np.asarray(edges, dtype=np.int64).reshape(-1, 2),
+        np.asarray(map_u, dtype=np.int64),
+        np.asarray(map_v, dtype=np.int64),
+    )
+
+
+def minesweeper_num_nodes(size: int = 9, patch: int = 5, stride: int = 2) -> int:
+    return len(_patch_starts(size, patch, stride)) ** 2
+
+
+def build_minesweeper_graph(
+    size: int = 9, patch: int = 5, stride: int = 2
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``(cell_ids [A, patch*patch], edges [E, 2], map_u [E], map_v [E])`` tensors."""
+    ids, edges, map_u, map_v = _minesweeper_layout(size, patch, stride)
+    return tuple(torch.as_tensor(x.copy(), dtype=torch.long) for x in (ids, edges, map_u, map_v))
+
+
+def minesweeper_slice_batch(batch_grids: torch.Tensor, cell_ids: torch.Tensor) -> torch.Tensor:
+    """``[B, S*S, ...]`` per-cell values -> ``[B, A, patch*patch, ...]`` agent views."""
+    grids = torch.as_tensor(batch_grids)
+    ids = torch.as_tensor(cell_ids, device=grids.device)
+    return grids[:, ids.reshape(-1)].reshape(grids.shape[0], *ids.shape, *grids.shape[2:])
+
+
+def reassemble_minesweeper_logits(batch_logits: torch.Tensor, cell_ids: torch.Tensor) -> torch.Tensor:
+    """Average every agent's prediction per cell: ``[B, A, L, C]`` -> ``[B, S*S, C]``."""
+    logits = torch.as_tensor(batch_logits)
+    if logits.ndim != 4:
+        raise ValueError(f"expected logits of shape (B,A,L,C); got {logits.shape}")
+    ids = torch.as_tensor(cell_ids, device=logits.device).reshape(-1)
+    b, _, _, c = logits.shape
+    cells = int(ids.max()) + 1
+    out = torch.zeros(b, cells, c, dtype=logits.dtype, device=logits.device)
+    out.index_add_(1, ids, logits.reshape(b, -1, c))
+    counts = torch.bincount(ids, minlength=cells).to(logits.dtype)
+    return out / counts[None, :, None]
+
+
+# =============================================================================
 # Maze wall-border pre-pad for boundary agents.
 # =============================================================================
 
