@@ -75,7 +75,7 @@ class ModelConfig:
     # --- recurrent-MPNN baseline (ignored by SheafADMMModel) ---
     mpnn_message_dim: int | None = None  # message width (defaults to d_e)
     mpnn_aggregation: str = "max"  # add | mean | symnorm | max
-    mpnn_edge_type_mode: str = "spatial"  # shared (1) | spatial (4/8) | slot (9, sudoku)
+    mpnn_edge_type_mode: str = "spatial"  # shared (1) | spatial (4/8) | slot (rm_num_slots)
     mpnn_graph_readout: str = "per_node"  # per_node (maze/sudoku) | graph (MNIST)
 
     # --- decoder ---

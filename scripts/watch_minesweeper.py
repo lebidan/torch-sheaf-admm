@@ -1,4 +1,7 @@
-"""Watch a trained Sheaf-ADMM Minesweeper model solve boards, iteration by iteration.
+"""Watch a trained Minesweeper model solve boards, iteration by iteration.
+
+Works for Sheaf-ADMM checkpoints (k = ADMM iterations) and MPNN baselines
+(k = message-passing rounds).
 
 For every board, the model is run with k = 1, 2, ... ADMM iterations. Each panel
 shows, on the hidden cells, the model's mine probability (white = safe, red =
@@ -236,6 +239,7 @@ def mine_probabilities(args, ckpt, inputs, labels, ks) -> np.ndarray:
     from sheaf_admm.training.loop import _forward, move_to_device
 
     cfg = ckpt["config"]
+    model_type = cfg["model_type"]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     params = ckpt.get("ema_state") if args.params == "ema" else ckpt["model_state"]
     if params is None:
@@ -245,14 +249,16 @@ def mine_probabilities(args, ckpt, inputs, labels, ks) -> np.ndarray:
     fwd, targets, _aux = task.prepare({"inputs": inputs, "labels": labels})
     fwd, targets = move_to_device(fwd, device), move_to_device(targets, device)
     with torch.no_grad():  # materialize lazy layers before loading weights
-        _forward(model, fwd, n_iter=1, loss_window=1, model_type="sheaf", training=False)
+        _forward(model, fwd, n_iter=1, loss_window=1, model_type=model_type, training=False)
     model.load_state_dict(params)
     model.eval()
     out = []
     with torch.no_grad():
         for k in ks:
-            logits = _forward(model, fwd, n_iter=k, loss_window=1, model_type="sheaf",
-                              training=False)[-1]
+            logits = _forward(model, fwd, n_iter=k, loss_window=1, model_type=model_type,
+                              training=False)
+            if model_type == "sheaf":
+                logits = logits[-1]  # last ADMM iteration of the window
             grid = V.reassemble_minesweeper_logits(logits.permute(1, 0, 2, 3), targets["cell_ids"])
             out.append(grid.softmax(dim=-1)[..., 1].cpu().numpy())
     return np.stack(out, axis=1)
@@ -283,7 +289,8 @@ def main() -> None:
     cfg = ckpt["config"]
     if cfg.get("task") != "minesweeper":
         raise ValueError(f"expected a minesweeper checkpoint, got task={cfg.get('task')!r}")
-    k_eval = int(cfg["training"].get("K_eval", 8))
+    key = "K_eval" if cfg["model_type"] == "sheaf" else "mpnn_eval_rounds"
+    k_eval = int(cfg["training"].get(key, 8))
     ks = sorted(set(args.ks or [1, 2, 3, 5, k_eval]))
     if args.live and not args.ks:
         ks = list(range(1, k_eval + 1))

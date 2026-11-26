@@ -63,3 +63,46 @@ def test_topk_fixes_a_miscalibrated_but_well_ranked_board():
     metrics = task.evaluate(torch.stack((torch.zeros_like(margin), margin), dim=-1), targets, aux)
     assert metrics["solved"] == 0.0
     assert metrics["solved_topk"] == 1.0
+
+
+def test_mpnn_baseline_runs_with_one_edge_type_per_cell_position():
+    from sheaf_admm.models import model_config_from_dict
+    from sheaf_admm.training import build_model
+
+    rng = np.random.default_rng(5)
+    nbrs = neighbours(6)
+    boards = []
+    while len(boards) < 3:
+        board = generate_board(rng, 6, 5, int(rng.integers(9, 32)), nbrs)
+        if board is not None:
+            boards.append(board)
+    inputs, labels = map(np.stack, zip(*boards, strict=True))
+    task = make_task("minesweeper", patch_size=4, stride=2, mine_weight=2.0)
+    fwd, targets, aux = task.prepare({"inputs": inputs, "labels": labels})
+    assert int(fwd["model_kwargs"]["map_u"].max()) >= 9  # more than Sudoku's 9 slots
+
+    cfg = model_config_from_dict(
+        {
+            "num_classes": 2,
+            "agent_state_dim": 32,
+            "message_dim": 8,
+            "encoder_arch": "mlp",
+            "enc_hidden_dim": 32,
+            "decoder_arch": "mlp_concat_v2",
+            "dec_hidden_dim": 32,
+            "dec_output_shape": [16, 2],
+            "mpnn_message_dim": 8,
+            "mpnn_aggregation": "max",
+            "mpnn_edge_type_mode": "slot",
+            "rm_num_slots": 16,
+            "mpnn_graph_readout": "per_node",
+        }
+    )
+    model = build_model(cfg, "mpnn")
+    logits, _hidden = model(
+        fwd["patches"], fwd["edge_indices"], num_rounds=2, **fwd["model_kwargs"],
+        training=False, compile_steps=False,
+    )
+    assert logits.shape == (4, 3, 16, 2)
+    assert torch.isfinite(task.loss(logits.unsqueeze(0), targets))
+    assert set(task.evaluate(logits, targets, aux)) >= {"solved", "solved_topk"}

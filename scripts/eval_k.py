@@ -1,4 +1,7 @@
-"""Evaluate a Sheaf-ADMM checkpoint on a full split for several ADMM iteration counts.
+"""Evaluate a checkpoint on a full split for several iteration counts.
+
+Works for Sheaf-ADMM checkpoints (K = ADMM iterations) and MPNN baselines
+(K = message-passing rounds), so both can be compared on the same boards.
 
 If metrics keep improving past the ``K_eval`` used during training, the model
 can still reason further and simply needs more iterations at test time.
@@ -53,8 +56,11 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     cfg = ckpt["config"]
-    if cfg.get("model_type") != "sheaf":
-        raise ValueError("eval_k supports Sheaf-ADMM checkpoints only")
+    model_type = cfg.get("model_type")
+    if model_type not in ("sheaf", "mpnn"):
+        raise ValueError(f"unsupported model_type={model_type!r}")
+    if model_type == "mpnn" and cfg["model"].get("mpnn_graph_readout", "per_node") == "graph":
+        raise ValueError("eval_k supports per-node MPNN readouts only (not graph classification)")
     if cfg["data"].get("loader", "puzzle") != "puzzle":
         raise ValueError("eval_k supports puzzle datasets only")
     params = ckpt.get("ema_state") if args.params == "ema" else ckpt["model_state"]
@@ -72,24 +78,27 @@ def main() -> None:
         for fwd, targets, aux in [task.prepare(b)]
     ]
     with torch.no_grad():  # materialize lazy layers before loading weights
-        _forward(model, batches[0][0], n_iter=1, loss_window=1, model_type="sheaf", training=False)
+        _forward(model, batches[0][0], n_iter=1, loss_window=1, model_type=model_type, training=False)
     model.load_state_dict(params)
     model.eval()
 
     total = sum(n for *_, n in batches)
     print(f"checkpoint: {args.checkpoint}")
     print(f"data: {data_dir} [{split}], {total} puzzles, params={args.params}, "
-          f"trained with K_train={cfg['training'].get('K_train')} "
-          f"K_eval={cfg['training'].get('K_eval')}")
+          + (f"trained with K_train={cfg['training'].get('K_train')} "
+             f"K_eval={cfg['training'].get('K_eval')}" if model_type == "sheaf" else
+             f"MPNN trained with {cfg['training'].get('mpnn_train_rounds')} rounds, "
+             f"evaluated with {cfg['training'].get('mpnn_eval_rounds')}"))
     for k in args.ks:
         start = time.time()
         agg: dict[str, float] = {}
         with torch.no_grad():
             for fwd, targets, aux, n in batches:
                 logits = _forward(
-                    model, fwd, n_iter=k, loss_window=1, model_type="sheaf", training=False
+                    model, fwd, n_iter=k, loss_window=1, model_type=model_type, training=False
                 )
-                for name, value in task.evaluate(logits[-1], targets, aux).items():
+                final = logits if model_type == "mpnn" else logits[-1]
+                for name, value in task.evaluate(final, targets, aux).items():
                     agg[name] = agg.get(name, 0.0) + value * n
         line = "  ".join(f"{name}={agg[name] / total * 100:.2f}%" for name in agg)
         print(f"[K={k:>4}] {line}  ({time.time() - start:.1f}s)")

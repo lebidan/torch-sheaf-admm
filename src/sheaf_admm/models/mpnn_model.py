@@ -36,7 +36,10 @@ class MPNNModel(nn.Module):
             enc_kwargs.update(d_model=c.enc_d_model, num_blocks=c.enc_num_blocks)
         self.encoder = create_encoder(c.encoder_arch, **enc_kwargs)
         self.init_hidden = Dense(c.d_v, c.d_v)
-        num_types = {"shared": 1, "spatial": c.num_directions, "slot": 9}[c.mpnn_edge_type_mode]
+        # "slot": one edge type per shared-cell position (rm_num_slots; 9 for Sudoku)
+        num_types = {"shared": 1, "spatial": c.num_directions, "slot": c.rm_num_slots}[
+            c.mpnn_edge_type_mode
+        ]
         self.ggnn = DirectionalGGNN(
             c.d_v, c.mpnn_message_dim or c.d_e, num_types, c.mpnn_aggregation, context_dim=c.d_v
         )
