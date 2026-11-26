@@ -15,8 +15,9 @@ Generation of one board (see :func:`generate_board`):
    kept only if (a) every hidden cell still touches a revealed number and
    (b) the solver still finds exactly one consistent layout;
 4. stop once the board has a target number of hidden safe cells, drawn per board
-   in ``[--hidden-safe-min, --hidden-safe-max]`` (difficulty knob), or once no
-   further cell can be hidden (a *minimal* puzzle, the hardest kind).
+   in ``[--hidden-safe-min, --hidden-safe-max]`` (difficulty knob; defaults: 30%
+   of the safe cells .. all of them), or once no further cell can be hidden (a
+   *minimal* puzzle, the hardest kind).
 
 The total number of mines is not given to the model, hence rule (a): a hidden
 cell touching no number could only be deduced from that total.
@@ -29,7 +30,11 @@ Tokens (same convention as the other puzzle datasets):
     labels: 1 = safe, 2 = mine
 
 Usage:
-    python -m sheaf_admm.data.build_minesweeper --output-dir datasets/minesweeper_9x9
+    python -m sheaf_admm.data.build_minesweeper                       # 9x9, 10 mines
+    python -m sheaf_admm.data.build_minesweeper --size 6 --mines 5    # 6x6, 5 mines
+
+Small boards have few distinct puzzles: 4x4 already repeats about half of its
+boards after 30k draws (risk of memorisation), 6x6 with 5 mines does not.
 """
 
 from __future__ import annotations
@@ -56,11 +61,22 @@ class MinesweeperConfig:
     mines: int = 10
     train_size: int = 100_000
     test_size: int = 1_000
-    hidden_safe_min: int = 20
-    hidden_safe_max: int = 71
+    hidden_safe_min: int | None = None  # default: 30% of the safe cells
+    hidden_safe_max: int | None = None  # default: every safe cell (minimal puzzles)
     seed: int = 0
     workers: int = 1
-    output_dir: Path = Path("datasets/minesweeper_9x9")
+    output_dir: Path | None = None  # default: datasets/minesweeper_<size>x<size>
+
+    def __post_init__(self) -> None:
+        safe = self.size * self.size - self.mines
+        if self.hidden_safe_min is None:
+            self.hidden_safe_min = max(1, int(0.3 * safe))
+        if self.hidden_safe_max is None:
+            self.hidden_safe_max = safe
+        if not 0 <= self.hidden_safe_min <= self.hidden_safe_max:
+            raise ValueError("need 0 <= hidden_safe_min <= hidden_safe_max")
+        if self.output_dir is None:
+            self.output_dir = Path(f"datasets/minesweeper_{self.size}x{self.size}")
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -323,16 +339,16 @@ def build(cfg: MinesweeperConfig) -> None:
 
 def parse_args() -> MinesweeperConfig:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    d = MinesweeperConfig()
+    d = MinesweeperConfig()  # defaults for size / mines / counts
     p.add_argument("--size", type=int, default=d.size)
     p.add_argument("--mines", type=int, default=d.mines)
     p.add_argument("--train-size", type=int, default=d.train_size)
     p.add_argument("--test-size", type=int, default=d.test_size)
-    p.add_argument("--hidden-safe-min", type=int, default=d.hidden_safe_min)
-    p.add_argument("--hidden-safe-max", type=int, default=d.hidden_safe_max)
+    p.add_argument("--hidden-safe-min", type=int, default=None)
+    p.add_argument("--hidden-safe-max", type=int, default=None)
     p.add_argument("--seed", type=int, default=d.seed)
     p.add_argument("--workers", type=int, default=d.workers)
-    p.add_argument("--output-dir", type=Path, default=d.output_dir)
+    p.add_argument("--output-dir", type=Path, default=None)
     a = p.parse_args()
     return MinesweeperConfig(
         size=a.size, mines=a.mines, train_size=a.train_size, test_size=a.test_size,

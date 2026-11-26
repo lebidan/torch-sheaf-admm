@@ -1,0 +1,65 @@
+# @package _global_
+# Sheaf-ADMM Minesweeper 6x6 / 5 mines, uniquely solvable boards. Small, fast
+# version of minesweeper_sheaf.yaml (9x9). Build the data first:
+#   python -m sheaf_admm.data.build_minesweeper --size 6 --mines 5
+#
+# * Agents: 4x4 patches every 2 cells -> 4 agents (2x2), 40 shared-cell edges;
+#   neighbouring agents share 2 rows or 2 columns. Every 3x3 neighbourhood of a
+#   number fits inside one agent (checked by the task).
+# * agent_state_dim = 16 cells x message_dim 8 = 128 (one block per cell).
+# * Mines are ~22% of the hidden cells -> mine_weight 2.
+# * Smaller board, shorter deductions: K drawn in [5, 15], evaluated at K = 15.
+task: minesweeper
+model_type: sheaf
+
+training:
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  epochs: 30
+  lr_schedule: cosine
+  min_lr_ratio: 0.05
+  batch_size: 128
+  K_train: 15
+  train_iters_dist: uniform
+  train_iters_min: 5
+  K_eval: 15
+  loss_window: 2
+  val_interval: 1
+  best_metric: solved_topk
+
+data:
+  dir: datasets/minesweeper_6x6
+  train_split: train
+  val_splits: [test]
+  loader: puzzle
+  augment: dihedral
+
+task_cfg:
+  patch_size: 4
+  stride: 2
+  mine_weight: 2.0
+  mask_revealed: true
+  topk_decode: true
+
+model:
+  num_classes: 2
+  agent_state_dim: 128   # d_v: 16 cells per agent x 8 numbers per cell
+  message_dim: 8         # d_e: numbers exchanged per shared cell
+  encoder_arch: mlp
+  enc_hidden_dim: 256
+  dropout_rate: 0.1
+  comm_norm_type: layernorm
+  objective_mode: non_negative
+  x_solver: diagonal_prox
+  z_solver: unrolled_cg
+  z_mode: prox
+  gamma: 2.0
+  cg_iters: 5
+  rm_sharing: sudoku     # per-slot maps (alias: slot)
+  rm_num_slots: 16       # one per cell position in a 4x4 patch
+  rm_init: soft_slice
+  rm_mode: fixed
+  rho_init: 0.25
+  decoder_arch: mlp_concat_v2
+  dec_hidden_dim: 256
+  dec_output_shape: [16, 2]
