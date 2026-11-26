@@ -13,21 +13,24 @@
 # * mine_weight: mines are ~20% of the hidden cells (10 of ~50).
 # * Loss and metrics only on hidden cells (revealed cells are safe by definition).
 # * *_topk metrics: the m highest-scoring hidden cells are mines (m = mine count).
-# * K random in [10, 20] (robust to the iteration count), evaluated at K = 20.
+# * Same recipe as minesweeper_6x6_sheaf.yaml (92% solved_topk on 6x6): batch 512,
+#   cg_iters 3, 40 epochs. Longer deductions on 9x9 (3x3 agent grid): K drawn in
+#   [5, 12], evaluated at K = 12. Check with scripts.eval_k whether more
+#   iterations help; if so, raise K_train together with K_eval.
 task: minesweeper
 model_type: sheaf
 
 training:
   lr: 1.0e-3
   weight_decay: 1.0e-4
-  epochs: 30
+  epochs: 40
   lr_schedule: cosine
   min_lr_ratio: 0.05
-  batch_size: 128
-  K_train: 20
+  batch_size: 512
+  K_train: 12
   train_iters_dist: uniform
-  train_iters_min: 10
-  K_eval: 20
+  train_iters_min: 5
+  K_eval: 12
   loss_window: 2
   val_interval: 1
   best_metric: solved_topk
@@ -59,7 +62,7 @@ model:
   z_solver: unrolled_cg
   z_mode: prox
   gamma: 2.0
-  cg_iters: 5
+  cg_iters: 3
   rm_sharing: sudoku     # per-slot maps (alias: slot)
   rm_num_slots: 25       # one per cell position in a 5x5 patch
   rm_init: soft_slice
