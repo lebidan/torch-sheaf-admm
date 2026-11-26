@@ -5,17 +5,22 @@
 #
 # Usage (depuis la racine du dépôt) :
 #   powershell -ExecutionPolicy Bypass -File scripts\run_minesweeper_benchmark.ps1 -PmStateDim 120
-#   ... -Only mpnn_cm_max,mpnn_cm_max_rand -Seeds 42      # sous-ensemble
+#   ... -Only mpnn_cm_max,mpnn_cm_max_rand -Seeds 42,123    # sous-ensemble (virgules acceptées)
 #
 # -PmStateDim : taille d'état du MPNN à paramètres égaux, donnée par
 #   uv run python -m scripts.match_params minesweeper_mpnn --match minesweeper_sheaf
 
 param(
     [int]$PmStateDim = 0,
-    [int[]]$Seeds = @(42, 123, 456),
+    [string[]]$Seeds = @("42", "123", "456"),
     [string[]]$Only = @(),
     [string]$OutRoot = "outputs/benchmark_9x9"
 )
+
+# With "powershell -File", "a,b,c" arrives as one string: split on commas ourselves.
+$Only = @($Only | ForEach-Object { $_ -split "," } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+$Seeds = @($Seeds | ForEach-Object { $_ -split "," } | ForEach-Object { $_.Trim() } | Where-Object { $_ } |
+    ForEach-Object { [int]$_ })
 
 $ErrorActionPreference = "Stop"
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
