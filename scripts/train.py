@@ -178,11 +178,15 @@ def main(cfg: DictConfig) -> None:
     for epoch in range(t.epochs):
         for batch in _train_batches(cfg, epoch):
             fwd, targets, _ = task.prepare(batch)
-            k = (
-                sample_k(rng_np, t.train_iters_dist, t.train_iters_min, t.K_train)
-                if cfg.model_type == "sheaf"
-                else t.mpnn_train_rounds
-            )
+            if cfg.model_type == "sheaf":
+                k = sample_k(rng_np, t.train_iters_dist, t.train_iters_min, t.K_train)
+            else:  # MPNN: fixed by default, or uniform like the sheaf's K
+                k = sample_k(
+                    rng_np,
+                    t.get("mpnn_train_rounds_dist", "fixed"),
+                    t.get("mpnn_train_rounds_min", t.mpnn_train_rounds),
+                    t.mpnn_train_rounds,
+                )
             state, loss = train_step(state, fwd, targets, n_iter=k, loss_window=t.loss_window)
             step += 1
             loss = float(loss)

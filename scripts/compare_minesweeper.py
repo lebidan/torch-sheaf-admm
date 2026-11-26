@@ -449,9 +449,10 @@ def build_report(res, meta, out_dir: Path, fps: int) -> None:
         for name in names:
             curves = np.array([run["metrics"][train]["solved"] for run in res[name]]) * 100
             m, s = curves.mean(0), curves.std(0)
-            ax_c.plot(kk, m, color=COLORS[name], label=name)
-            ax_c.fill_between(kk, m - s, m + s, color=COLORS[name], alpha=0.2)
-            ax_c.axvline(res[name][0]["eval_k"], color=COLORS[name], ls=":", lw=1)
+            color = COLORS.get(name, COLORS["MPNN"])
+            ax_c.plot(kk, m, color=color, label=name)
+            ax_c.fill_between(kk, m - s, m + s, color=color, alpha=0.2)
+            ax_c.axvline(res[name][0]["eval_k"], color=color, ls=":", lw=1)
         ax_c.set_xlabel("itérations k (ADMM / tours de messages)")
         ax_c.set_ylabel("plateaux résolus (%)")
         ax_c.set_ylim(0, 102)
@@ -476,10 +477,11 @@ def build_report(res, meta, out_dir: Path, fps: int) -> None:
                 summary["size_generalisation"].setdefault(name, {})[f"{s}x{s}"] = {
                     "solved_at_kmax": sol[-1], "iters_to_solve": its[-1]}
             sol, its = np.array(sol), np.array(its)
+            color = COLORS.get(name, COLORS["MPNN"])
             ax_s.errorbar(sizes, sol[:, 0] * 100, yerr=sol[:, 1] * 100, marker="o", capsize=3,
-                          color=COLORS[name], label=name)
+                          color=color, label=name)
             ax_i.errorbar(sizes, its[:, 0], yerr=its[:, 1], marker="o", capsize=3,
-                          color=COLORS[name], label=name)
+                          color=color, label=name)
         for ax in (ax_s, ax_i):
             ax.axvline(train, color="#6b7280", ls=":", lw=1)
             ax.set_xlabel("taille du plateau")
@@ -661,6 +663,8 @@ def build_report(res, meta, out_dir: Path, fps: int) -> None:
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--sheaf", nargs="+", required=True, help="Sheaf-ADMM checkpoint(s), one per seed")
+    p.add_argument("--mpnn-label", default="MPNN",
+                   help='name of the MPNN variant in tables / figures, e.g. "MPNN (PM, mean)"')
     p.add_argument("--mpnn", nargs="*", default=[],
                    help="MPNN checkpoint(s), one per seed (optional: Sheaf-ADMM alone otherwise)")
     p.add_argument("--sizes", type=int, nargs="+", default=[4, 5, 6, 9, 12])
@@ -678,7 +682,7 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     runs = {"Sheaf-ADMM": [LoadedModel(c, device) for c in args.sheaf],
-            "MPNN": [LoadedModel(c, device) for c in args.mpnn]}
+            args.mpnn_label: [LoadedModel(c, device) for c in args.mpnn]}
     runs = {name: models for name, models in runs.items() if models}
     ref = runs["Sheaf-ADMM"][0]
     data_dir = Path(ref.cfg["data"]["dir"])

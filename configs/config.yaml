@@ -40,6 +40,8 @@ training:
   # MPNN baseline message-passing rounds (the K analog for the recurrent MPNN).
   mpnn_train_rounds: 40
   mpnn_eval_rounds: 100
+  mpnn_train_rounds_dist: fixed   # fixed | uniform (rounds ~ U[mpnn_train_rounds_min, mpnn_train_rounds])
+  mpnn_train_rounds_min: 1
 
 data:
   dir: ???            # set per experiment
