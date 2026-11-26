@@ -1,0 +1,64 @@
+# @package _global_
+# Fast N-Queens: same model and data as n_queens_sheaf.yaml, about 3-4x cheaper.
+#
+# * d_v 80 / d_e 8 (was 160 / 16): 10 blocks of 8 dims per agent (one per line
+#   position) instead of 16; same graph and same 600 shared-cell edges.
+# * K drawn in [10, 20] (was [20, 40]), K_eval 20: the main cost driver, since
+#   every ADMM iteration is unrolled for backprop.
+# * batch_size 128 (was 64): fits again with half the iterations and half the
+#   state size; fewer, larger steps per epoch.
+# * 40 epochs (was 80); the cosine schedule follows the epoch count.
+#
+# See n_queens_sheaf.yaml for the rationale of every other setting.
+task: n_queens
+model_type: sheaf
+
+training:
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  epochs: 40
+  lr_schedule: cosine
+  min_lr_ratio: 0.05
+  batch_size: 128
+  K_train: 20            # max ADMM iterations during training
+  train_iters_dist: uniform
+  train_iters_min: 10     # K drawn uniformly in [10, 20] at every training step
+  K_eval: 20
+  loss_window: 2
+  val_interval: 1
+  best_metric: solved_perm
+
+data:
+  dir: datasets/n_queens_10x10_orbits
+  train_split: train
+  val_splits: [test]
+  loader: puzzle
+  augment: dihedral
+
+task_cfg:
+  diagonals: true
+  queen_weight: 3.0
+  perm_decode: true
+
+model:
+  num_classes: 2
+  d_v: 80                # 10 line positions x 8-dim blocks
+  d_e: 8
+  encoder_arch: mlp
+  enc_hidden_dim: 256
+  dropout_rate: 0.1
+  comm_norm_type: layernorm
+  objective_mode: non_negative
+  x_solver: diagonal_prox
+  z_solver: unrolled_cg
+  z_mode: prox
+  gamma: 2.0
+  cg_iters: 5
+  rm_sharing: sudoku     # per-slot maps (alias: slot)
+  rm_num_slots: 40       # 4 agent types x N=10 positions
+  rm_init: soft_slice
+  rm_mode: fixed
+  rho_init: 0.25
+  decoder_arch: mlp_concat_v2
+  dec_hidden_dim: 256
+  dec_output_shape: [10, 2]
