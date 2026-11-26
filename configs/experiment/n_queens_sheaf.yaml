@@ -12,7 +12,7 @@
 # * augment: dihedral — the 8 board symmetries preserve the N-Queens rules and the
 #   uniqueness of the solution; fights memorizing (clues -> solution) pairs
 #   (10-queens has only 724 solutions). Plus dropout / weight decay.
-# * K_train/K_eval 40/80: more ADMM rounds to propagate constraints; 80 epochs
+# * K_train 40: more ADMM rounds to propagate constraints; 80 epochs
 #   (run 2 was still improving at epoch 39); checkpoint_best.pt on solved_perm;
 #   cosine LR decay to 5% of lr to consolidate the end of training.
 # * batch_size 64: K_train=40 keeps twice the ADMM activations for backprop;
@@ -20,6 +20,8 @@
 # * data.dir: symmetry-disjoint split (build_N_Queens_orbits). In the HF split every
 #   test puzzle is a rotation/reflection of a train puzzle, which dihedral
 #   augmentation leaks into training. Old split: data.dir=datasets/n_queens_10x10
+# * K random in [20, 40]: with a fixed K=40 the model was only right at exactly
+#   40 iterations (100% at K=40, 82% at K=80); a random K forces it to stabilise.
 task: n_queens
 model_type: sheaf
 
@@ -30,10 +32,11 @@ training:
   lr_schedule: cosine
   min_lr_ratio: 0.05
   batch_size: 64
-  K_train: 40
-  K_eval: 80
+  K_train: 40            # max ADMM iterations during training
+  train_iters_dist: uniform
+  train_iters_min: 20     # K drawn uniformly in [20, 40] at every training step
+  K_eval: 40
   loss_window: 2
-  train_iters_dist: fixed
   val_interval: 1
   best_metric: solved_perm
 
