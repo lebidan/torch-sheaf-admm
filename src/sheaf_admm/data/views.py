@@ -548,7 +548,7 @@ def _patch_starts(size: int, patch: int, stride: int) -> list[int]:
 def _minesweeper_layout(size: int, patch: int, stride: int):
     """``(cell_ids [A, patch*patch], edges [E, 2], map_u [E], map_v [E])`` as numpy arrays."""
     starts = _patch_starts(size, patch, stride)
-    ids = np.asarray(
+    cell_ids = np.asarray(
         [
             [(r0 + i) * size + (c0 + j) for i in range(patch) for j in range(patch)]
             for r0 in starts
@@ -556,7 +556,7 @@ def _minesweeper_layout(size: int, patch: int, stride: int):
         ],
         dtype=np.int64,
     )
-    window = min(3, size)
+    window = min(3, size)  # neighbourhood of a revealed number
     for r in range(size - window + 1):
         for c in range(size - window + 1):
             if not any(r0 <= r and r + window <= r0 + patch for r0 in starts) or not any(
@@ -566,20 +566,21 @@ def _minesweeper_layout(size: int, patch: int, stride: int):
                     f"patch={patch}, stride={stride} splits the 3x3 neighbourhood at "
                     f"({r + 1}, {c + 1}) across agents; use larger patches or a smaller stride"
                 )
+    # covering[cell] = every (agent, slot) that sees this cell
     covering: list[list[tuple[int, int]]] = [[] for _ in range(size * size)]
-    for a in range(ids.shape[0]):
-        for slot, cell in enumerate(ids[a]):
-            covering[cell].append((a, slot))
+    for agent in range(cell_ids.shape[0]):
+        for slot, cell in enumerate(cell_ids[agent]):
+            covering[cell].append((agent, slot))
     edges, map_u, map_v = [], [], []
-    for agents in covering:
-        for i in range(len(agents)):
-            for j in range(i + 1, len(agents)):
-                (u, su), (v, sv) = agents[i], agents[j]
-                edges.append((u, v))
-                map_u.append(su)
-                map_v.append(sv)
+    for agents_on_cell in covering:
+        for i in range(len(agents_on_cell)):
+            for j in range(i + 1, len(agents_on_cell)):
+                (agent_u, slot_u), (agent_v, slot_v) = agents_on_cell[i], agents_on_cell[j]
+                edges.append((agent_u, agent_v))
+                map_u.append(slot_u)
+                map_v.append(slot_v)
     return (
-        ids,
+        cell_ids,
         np.asarray(edges, dtype=np.int64).reshape(-1, 2),
         np.asarray(map_u, dtype=np.int64),
         np.asarray(map_v, dtype=np.int64),

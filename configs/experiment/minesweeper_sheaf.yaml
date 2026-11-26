@@ -6,7 +6,10 @@
 #   3x3 neighbourhood of a number fits inside one agent (checked by the task).
 # * rm_sharing sudoku + rm_num_slots 25: one restriction map per position inside
 #   the patch; soft_slice makes position k read block k of the agent state, so
-#   d_v = 25 blocks x d_e.
+#   agent_state_dim = 25 cells x message_dim.
+# * agent_state_dim (internal name d_v): size of each agent's state vector.
+#   message_dim (internal name d_e): size of the message two agents exchange
+#   about one shared cell.
 # * mine_weight: mines are ~20% of the hidden cells (10 of ~50).
 # * Loss and metrics only on hidden cells (revealed cells are safe by definition).
 # * *_topk metrics: the m highest-scoring hidden cells are mines (m = mine count).
@@ -45,8 +48,8 @@ task_cfg:
 
 model:
   num_classes: 2
-  d_v: 200               # 25 cell positions x 8-dim blocks
-  d_e: 8
+  agent_state_dim: 200   # d_v: 25 cells per agent x 8 numbers per cell
+  message_dim: 8         # d_e: numbers exchanged per shared cell
   encoder_arch: mlp
   enc_hidden_dim: 256
   dropout_rate: 0.1

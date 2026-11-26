@@ -20,8 +20,9 @@ class ModelConfig:
     num_classes: int = 6  # per-agent output channels (grid: vocab; sudoku: 10; cls: #classes)
 
     # --- stalk dims ---
-    d_v: int = 64  # vertex stalk (comm_dim)
-    d_e: int = 32  # edge stalk
+    # Config files may use the explicit aliases ``agent_state_dim`` / ``message_dim``.
+    d_v: int = 64  # agent state size (vertex stalk, comm_dim)
+    d_e: int = 32  # message size per shared item / edge (edge stalk)
 
     # --- encoder ---
     encoder_arch: str = "mlp_v2"  # "mlp_v2" (maze) | "mlp" (mnist) | "sudoku"
@@ -87,6 +88,13 @@ class ModelConfig:
     dec_norm_type: str = "rmsnorm"
 
 
+# Explicit names accepted in config files, mapped to the short internal fields.
+FIELD_ALIASES = {
+    "agent_state_dim": "d_v",  # size of each agent's state vector
+    "message_dim": "d_e",  # size of the message exchanged on each edge
+}
+
+
 def model_config_from_dict(d: dict[str, Any]) -> ModelConfig:
     """Build a :class:`ModelConfig`, coercing list fields to tuples and dropping ``None`` overrides.
 
@@ -94,6 +102,11 @@ def model_config_from_dict(d: dict[str, Any]) -> ModelConfig:
     ``model`` + ``solver`` Hydra subtrees.
     """
     out = dict(d)
+    for alias, field_name in FIELD_ALIASES.items():
+        if alias in out:
+            if field_name in out:
+                raise KeyError(f"set either {alias!r} or {field_name!r}, not both")
+            out[field_name] = out.pop(alias)
     # Legacy checkpoints/configs may carry pre-public no-op fields. They never
     # selected code paths in the public model, so ignore them on load.
     for key in ("task", "mpnn_num_rounds"):
