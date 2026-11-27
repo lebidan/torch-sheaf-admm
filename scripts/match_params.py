@@ -10,6 +10,9 @@ one dummy batch), so it follows any change in the code.
 
     # state size giving the MPNN as many parameters as the sheaf model
     python -m scripts.match_params minesweeper_mpnn --match minesweeper_sheaf
+
+    # paper protocol (Maze-style): message sizes tied to d_v / 2, as in maze_mpnn.yaml
+    python -m scripts.match_params minesweeper_grid_mpnn --match minesweeper_grid_sheaf --half-message
 """
 
 from __future__ import annotations
@@ -46,7 +49,7 @@ def dummy_batch(cfg: dict):
             return {"inputs": np.asarray(b["inputs"]), "labels": np.asarray(b["labels"])}
     except Exception:
         pass
-    if cfg["task"] != "minesweeper":
+    if cfg["task"] not in ("minesweeper", "minesweeper_grid"):
         raise FileNotFoundError(f"no dataset found in {data_dir}")
     from sheaf_admm.data.build_minesweeper import generate_board, neighbours
 
@@ -85,7 +88,17 @@ def main() -> None:
                    help="experiment whose parameter count the first (MPNN) experiment should match")
     p.add_argument("--min-dv", type=int, default=8)
     p.add_argument("--max-dv", type=int, default=512)
+    p.add_argument("--half-message", action="store_true",
+                   help="tie d_e and the MPNN message size to d_v // 2 (paper's Maze PM: 84 / 42 / 42)")
     args = p.parse_args()
+
+    def overrides(dv: int) -> dict:
+        out = {"d_v": dv}
+        if args.half_message:
+            half = max(1, dv // 2)
+            out.update(d_e=half, mpnn_message_dim=half)
+        return out
+
 
     for name in args.experiments:
         print(f"{name}: {count_params(load_experiment(name)):,} parameters".replace(",", " "))
@@ -96,16 +109,18 @@ def main() -> None:
     lo, hi = args.min_dv, args.max_dv
     while hi - lo > 1:  # the count grows with d_v: bisection
         mid = (lo + hi) // 2
-        if count_params(cfg, {"d_v": mid}) < target:
+        if count_params(cfg, overrides(mid)) < target:
             lo = mid
         else:
             hi = mid
-    best = min((lo, hi), key=lambda d: abs(count_params(cfg, {"d_v": d}) - target))
-    got = count_params(cfg, {"d_v": best})
+    best = min((lo, hi), key=lambda d: abs(count_params(cfg, overrides(d)) - target))
+    got = count_params(cfg, overrides(best))
     print(f"\ntarget ({args.match}): {target:,} parameters".replace(",", " "))
     print(f"{args.experiments[0]} with agent_state_dim={best}: {got:,} parameters "
           f"({(got - target) / target * 100:+.1f}%)".replace(",", " "))
-    print(f"-> training override: model.agent_state_dim={best}")
+    extra = (f" model.message_dim={max(1, best // 2)} model.mpnn_message_dim={max(1, best // 2)}"
+             if args.half_message else "")
+    print(f"-> training override: model.agent_state_dim={best}{extra}")
 
 
 if __name__ == "__main__":

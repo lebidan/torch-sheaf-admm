@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -342,18 +343,22 @@ class MinesweeperTask:
         self.mask_revealed = bool(mask_revealed)
         self.topk_decode = bool(topk_decode)
 
-    def prepare(self, batch):
+    def _check_batch(self, batch, square=True):
         inputs = torch.as_tensor(batch["inputs"], dtype=torch.long)
         labels = torch.as_tensor(batch["labels"], dtype=torch.long)
         if inputs.ndim != 2 or labels.shape != inputs.shape:
-            raise ValueError("Minesweeper inputs and labels must have the same [B, S*S] shape")
+            raise ValueError("Minesweeper inputs and labels must have the same [B, H*W] shape")
         height, width = V.infer_image_hw(inputs.shape[1], batch.get("height"), batch.get("width"))
-        if height != width:
+        if square and height != width:
             raise ValueError(f"Minesweeper requires square boards, got {(height, width)}")
         if inputs.min() < 1 or inputs.max() >= self.input_num_classes:
             raise ValueError("Minesweeper inputs must use tokens 1 (hidden) and 2..10 (numbers)")
         if not torch.isin(labels, torch.tensor((1, 2))).all():
             raise ValueError("Minesweeper labels must use tokens 1 (safe) and 2 (mine)")
+        return inputs, labels, height, width
+
+    def prepare(self, batch):
+        inputs, labels, height, width = self._check_batch(batch)
 
         cell_ids, edges, map_u, map_v = V.build_minesweeper_graph(
             height, self.patch_size, self.stride
@@ -401,10 +406,18 @@ class MinesweeperTask:
             "solved": correct.all(dim=1).float().mean().item(),
         }
 
+    def reassemble(self, logits, targets, aux):
+        """Per-agent logits ``[A, B, L, 2]`` -> board logits ``[B, S*S, 2]``."""
+        return V.reassemble_minesweeper_logits(logits.permute(1, 0, 2, 3), targets["cell_ids"])
+
+    def agent_positions(self, targets, aux):
+        """``[A, 2]`` (row, col) of each agent's top-left cell, for figures."""
+        cell_ids = torch.as_tensor(targets["cell_ids"]).cpu().numpy()
+        size = int(round(targets["hidden"].shape[1] ** 0.5))
+        return np.stack([cell_ids[:, 0] // size, cell_ids[:, 0] % size], 1)
+
     def evaluate(self, logits_final, targets, aux):
-        logits = V.reassemble_minesweeper_logits(
-            logits_final.permute(1, 0, 2, 3), targets["cell_ids"]
-        )
+        logits = self.reassemble(logits_final, targets, aux)
         mines, hidden = targets["mines"], targets["hidden"]
         scored = hidden if self.mask_revealed else torch.ones_like(hidden)
         predicted = (logits.argmax(dim=-1) == 1) & hidden  # revealed cells are safe
@@ -425,6 +438,103 @@ class MinesweeperTask:
         return metrics
 
 
+class MinesweeperGridTask(MinesweeperTask):
+    """Minesweeper with the paper's maze layout (``task: minesweeper_grid``).
+
+    Same boards, tokens, loss and metrics as :class:`MinesweeperTask`; only the
+    agents change, to follow the Maze setup of the article:
+
+    * the board is surrounded by a ``border``-cell ring of the token 0
+      ("outside the board"), the analogue of the maze's outer walls: an agent
+      sees explicitly where the board ends;
+    * agents are ``patch_size x patch_size`` patches centred every ``stride``
+      cells of that padded image (3x3 every 2 cells, as for Maze), linked to
+      their ``connectivity`` grid neighbours (8: one restriction map / edge type
+      per direction);
+    * nothing depends on the board size, so a model runs on any size. With 3x3 / 2,
+      all boards of the same parity are cut the same way: odd sizes tile exactly
+      (9x9 -> 25 agents, 17x17 -> 81, 33x33 -> 289), even sizes get a double ring
+      of padding on the right / bottom side (6x6 -> 16 agents, 12x12 -> 49,
+      24x24 -> 169). Train on one size, test on sizes of the same parity.
+
+    Neighbouring agents share one row / column / corner cell, so the 3x3
+    neighbourhood of a number is usually split between agents: checking it
+    needs communication (the point of the benchmark).
+    """
+
+    name = "minesweeper_grid"
+    outside_token = 0
+
+    def __init__(
+        self,
+        *,
+        patch_size=3,
+        stride=2,
+        connectivity=8,
+        border=1,
+        mine_weight=1.0,
+        mask_revealed=True,
+        topk_decode=True,
+    ):
+        super().__init__(
+            patch_size=patch_size,
+            stride=stride,
+            mine_weight=mine_weight,
+            mask_revealed=mask_revealed,
+            topk_decode=topk_decode,
+        )
+        self.connectivity = int(connectivity)
+        self.border = int(border)
+
+    def layout(self, height, width):
+        """Agent centres (padded-board coordinates), edges and positions."""
+        b = self.border
+        return _grid_graph((height + 2 * b, width + 2 * b), self.stride, self.patch_size,
+                           self.connectivity)
+
+    def _pad(self, img, value):
+        b = self.border
+        return F.pad(img.float(), (b, b, b, b), value=float(value)).long()
+
+    def prepare(self, batch):
+        inputs, labels, height, width = self._check_batch(batch, square=False)
+        count = inputs.shape[0]
+        centers, edges, positions = self.layout(height, width)
+        board = self._pad(inputs.reshape(count, height, width), self.outside_token)
+        patches = V.prepare_maze_patches(
+            board, centers, self.patch_size, self.input_num_classes,
+            border_fill=self.outside_token,
+        )  # [N, B, ps, ps, 11]
+        hidden = inputs == 1
+        mines = (labels == 2).long()
+        target = mines.masked_fill(~hidden, self.ignore_index) if self.mask_revealed else mines
+        target_img = self._pad(target.reshape(count, height, width), self.ignore_index)
+        label_patches, inside = V.get_agent_label_patches_jax(target_img, centers, self.patch_size)
+        label_patches = label_patches.masked_fill(inside == 0, self.ignore_index)
+        fwd = {
+            "patches": patches,
+            "edge_indices": edges,
+            "model_kwargs": {"node_positions": positions},
+        }
+        targets = {"slice_labels": label_patches.long(), "mines": mines.bool(), "hidden": hidden}
+        aux = {"centers": centers, "image_hw": (height, width)}
+        return fwd, targets, aux
+
+    def reassemble(self, logits, targets, aux):
+        """Per-agent logits ``[N, B, ps, ps, 2]`` -> board logits ``[B, H*W, 2]`` (mean)."""
+        height, width = aux["image_hw"]
+        b = self.border
+        grid = V.reassemble_logits(
+            logits, aux["centers"], (height + 2 * b, width + 2 * b), logits.shape[-1], mode="mean"
+        )
+        board = grid[:, b:b + height, b:b + width]
+        return board.reshape(board.shape[0], height * width, board.shape[-1])
+
+    def agent_positions(self, targets, aux):
+        """``[N, 2]`` (row, col) of each agent's centre on the board, for figures."""
+        return np.asarray(aux["centers"]) - self.border
+
+
 def make_task(name: str, **kwargs):
     tasks = {
         "maze": MazeTask,
@@ -432,6 +542,7 @@ def make_task(name: str, **kwargs):
         "sudoku": SudokuTask,
         "n_queens": NQueensTask,
         "minesweeper": MinesweeperTask,
+        "minesweeper_grid": MinesweeperGridTask,
     }
     if name not in tasks:
         raise KeyError(f"unknown task {name!r}; available: {sorted(tasks)}")

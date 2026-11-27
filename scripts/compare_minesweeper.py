@@ -31,7 +31,18 @@ cells are mines, m = mine count) is reported as an extra column.
         --sheaf outputs/2026-11-26/14-47-05/checkpoint_best.pt \\
         --mpnn  outputs/2026-11-26/15-23-39/checkpoint_best.pt
 
-Sizes: agents are patch x patch blocks every ``stride`` cells, so only sizes
+Paper protocol (``task: minesweeper_grid``, 3x3 agents every 2 cells around an
+"outside the board" ring, as for the paper's Maze): every size with the parity of
+the training board is cut like it (6x6 -> 8, 10, 12, ... ; 9x9 -> 11, 13, ...), and
+the OOD test splits of the dataset (test_ood_1.5x / 2x / 4x) are used when their
+size is asked for:
+
+    python -m scripts.compare_minesweeper \
+        --sheaf outputs/benchmark_grid_9x9/sheaf/seed42/checkpoint_best.pt ... \
+        --mpnn  outputs/benchmark_grid_9x9/mpnn_pm_max/seed42/checkpoint_best.pt ... \
+        --sizes 9 13 17 25 33 --kmax 100 --out-dir comparisons/grid_9x9
+
+Sizes (``task: minesweeper``): agents are patch x patch blocks every ``stride`` cells, so only sizes
 patch + stride*n give the same overlaps as in training (5x5 agents every 2
 cells: 9, 11, 13, 15, 17, 19...; 4x4 agents: 4, 6, 8, 10, 12...). Other sizes
 shift the last agent by one cell, an overlap never seen in training, and are
@@ -59,7 +70,7 @@ if str(PROJECT_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 HIDDEN, MINE, NUMBER_OFFSET = 1, 2, 2
-ABLATION_KS = (1, 2, 5, 10, 20, 30)
+ABLATION_KS = (1, 2, 5, 10, 20, 30, 40, 50, 100)  # paper Table 3 (1..30) + longer horizons
 COLORS = {"Sheaf-ADMM": "#1d4ed8", "MPNN": "#ea580c"}
 NUMBER_COLORS = {
     1: "#1d4ed8", 2: "#15803d", 3: "#dc2626", 4: "#1e3a8a",
@@ -127,12 +138,12 @@ class LoadedModel:
         ckpt = torch.load(path, map_location="cpu", weights_only=False)
         self.path = path
         self.cfg = ckpt["config"]
-        if self.cfg.get("task") != "minesweeper":
+        if self.cfg.get("task") not in ("minesweeper", "minesweeper_grid"):
             raise ValueError(f"{path}: not a minesweeper checkpoint")
         self.model_type = self.cfg["model_type"]
         self.name = "Sheaf-ADMM" if self.model_type == "sheaf" else "MPNN"
         self.device = device
-        self.task = make_task("minesweeper", **self.cfg.get("task_cfg", {}))
+        self.task = make_task(self.cfg["task"], **self.cfg.get("task_cfg", {}))
         self.model = build_model(model_config_from_dict(self.cfg["model"]), self.model_type)
         self.model.to(device)
         self.params = ckpt.get("ema_state") or ckpt["model_state"]
@@ -149,8 +160,12 @@ class LoadedModel:
     def _prepare(self, inputs, labels):
         from sheaf_admm.training.loop import move_to_device
 
-        fwd, targets, _ = self.task.prepare({"inputs": inputs, "labels": labels})
-        return move_to_device(fwd, self.device), move_to_device(targets, self.device)
+        fwd, targets, aux = self.task.prepare({"inputs": inputs, "labels": labels})
+        return move_to_device(fwd, self.device), move_to_device(targets, self.device), aux
+
+    def num_agents(self, inputs, labels) -> int:
+        fwd, _targets, _aux = self.task.prepare({"inputs": inputs[:1], "labels": labels[:1]})
+        return int(fwd["patches"].shape[0])
 
     def _ensure_loaded(self, fwd):
         import torch
@@ -171,29 +186,23 @@ class LoadedModel:
         """``[kmax, B, cells]`` mine probability after k = 1..kmax iterations."""
         import torch
 
-        from sheaf_admm.data import views as V
-
         out = []
         for start in range(0, len(inputs), chunk):
-            fwd, targets = self._prepare(inputs[start:start + chunk], labels[start:start + chunk])
+            fwd, targets, aux = self._prepare(inputs[start:start + chunk], labels[start:start + chunk])
             self._ensure_loaded(fwd)
-            cell_ids = targets["cell_ids"]
             per_k = []
             with torch.no_grad():
                 if self.model_type == "sheaf":
                     _hist, logits, *_ = self.model.coordinate_history(
                         fwd["patches"], fwd["edge_indices"], num_iters=kmax,
                         **fwd["model_kwargs"], training=False)
-                    for k in range(kmax):  # logits: [K, A, B, L, 2]
-                        grid = V.reassemble_minesweeper_logits(logits[k].permute(1, 0, 2, 3), cell_ids)
-                        per_k.append(grid.softmax(-1)[..., 1].cpu().numpy())
-                else:
-                    for k in range(1, kmax + 1):
-                        logits, _ = self.model(fwd["patches"], fwd["edge_indices"], num_rounds=k,
-                                               **fwd["model_kwargs"], training=False,
-                                               compile_steps=False)
-                        grid = V.reassemble_minesweeper_logits(logits.permute(1, 0, 2, 3), cell_ids)
-                        per_k.append(grid.softmax(-1)[..., 1].cpu().numpy())
+                else:  # one pass, logits after every round
+                    logits, _ = self.model(fwd["patches"], fwd["edge_indices"], num_rounds=kmax,
+                                           **fwd["model_kwargs"], training=False,
+                                           compile_steps=False, return_history=True)
+                for k in range(kmax):  # logits: [K, agents, B, ..., 2]
+                    grid = self.task.reassemble(logits[k], targets, aux)
+                    per_k.append(grid.softmax(-1)[..., 1].cpu().numpy())
             out.append(np.stack(per_k))
         return np.concatenate(out, axis=1)
 
@@ -201,30 +210,36 @@ class LoadedModel:
         """ADMM internals for one board (Sheaf-ADMM only)."""
         import torch
 
-        fwd, targets = self._prepare(inputs[None], labels[None])
+        fwd, targets, aux = self._prepare(inputs[None], labels[None])
         self._ensure_loaded(fwd)
         with torch.no_grad():
             hist, *_ = self.model.coordinate_history(
                 fwd["patches"], fwd["edge_indices"], num_iters=kmax,
                 **fwd["model_kwargs"], training=False)
-        cell_ids = targets["cell_ids"].cpu().numpy()
-        size = int(round(math.sqrt(inputs.shape[0])))
         return {
             "x": hist.x[:, :, 0].cpu().numpy(),            # [K, N, d_v]
             "z": hist.z[:, :, 0].cpu().numpy(),
             "primal": hist.primal_res[:, :, 0].cpu().numpy(),  # [K, N]
             "dual": hist.dual_res[:, :, 0].cpu().numpy(),
-            "agent_rc": np.stack([cell_ids[:, 0] // size, cell_ids[:, 0] % size], 1),
+            "agent_rc": np.asarray(self.task.agent_positions(targets, aux)),
         }
 
 
 def load_boards(size, mines, count, seed, test_dir=None):
-    """Test-split boards when available (training size), else generated ones."""
-    if test_dir is not None and (Path(test_dir) / "test" / "all__inputs.npy").exists():
-        x = np.load(Path(test_dir) / "test" / "all__inputs.npy")[:count]
-        y = np.load(Path(test_dir) / "test" / "all__labels.npy")[:count]
-        if x.shape[1] == size * size:
-            return x.astype(np.int64), y.astype(np.int64), f"test split of {test_dir}"
+    """Boards of a dataset split of this size when there is one (``test`` first, then
+    the OOD splits ``test_ood_*``), else boards generated with a fixed seed."""
+    if test_dir is not None:
+        root = Path(test_dir)
+        splits = ["test"] + sorted(p.name for p in root.glob("test_ood_*") if p.is_dir())
+        for split in splits:
+            if not (root / split / "all__inputs.npy").exists():
+                continue
+            x = np.load(root / split / "all__inputs.npy", mmap_mode="r")
+            if x.shape[1] != size * size:
+                continue
+            y = np.load(root / split / "all__labels.npy", mmap_mode="r")
+            x, y = np.asarray(x[:count]), np.asarray(y[:count])
+            return x.astype(np.int64), y.astype(np.int64), f"split {split} of {test_dir}"
     from sheaf_admm.data.build_minesweeper import generate_board, neighbours
 
     rng = np.random.default_rng(seed + 1000 * size)
@@ -387,6 +402,8 @@ def build_report(res, meta, out_dir: Path, fps: int) -> None:
             lines.append(f"{name} : {len(res[name])} seed(s) {[r['seed'] for r in res[name]]}, "
                          f"{r0['num_params']:,} paramètres, entraîné avec {r0['train_k']}, "
                          f"évalué à K = {r0['eval_k']}".replace(",", " "))
+        lines += ["", f"Découpage : {meta.get('layout', '')}.  Agents par taille : "
+                  + ", ".join(f"{s}×{s} : {meta['agents'].get(str(s), '?')}" for s in sizes) + "."]
         lines += ["", "Critères (article) : un plateau est résolu si toutes les cases cachées sont bien",
                   "classées (argmax mine / sûre) ; précision par case sur les cases cachées.",
                   "Moyenne ± écart-type sur les seeds.  solved_topk : les m cases les plus probables sont",
@@ -466,20 +483,27 @@ def build_report(res, meta, out_dir: Path, fps: int) -> None:
         # ---- Fig 6: size generalisation ------------------------------------------
         fig, (ax_s, ax_i) = plt.subplots(1, 2, figsize=(11.69, 5.2))
         for name in names:
-            sol, its = [], []
+            sol, sol_eval, its = [], [], []
+            k_eval = min(res[name][0]["eval_k"], kmax)
             for s in sizes:
                 v = per_seed(name, s, "solved", kmax)
                 sol.append(mean_std(v) if v else (np.nan, 0))
+                v = per_seed(name, s, "solved", k_eval)
+                sol_eval.append(mean_std(v) if v else (np.nan, 0))
                 firsts = np.concatenate([run["metrics"][s]["iters_to_solve"] for run in res[name]
                                          if s in run["metrics"]] or [np.array([0])])
                 solved_ones = firsts[firsts > 0]
                 its.append((solved_ones.mean(), solved_ones.std()) if solved_ones.size else (np.nan, 0))
                 summary["size_generalisation"].setdefault(name, {})[f"{s}x{s}"] = {
-                    "solved_at_kmax": sol[-1], "iters_to_solve": its[-1]}
-            sol, its = np.array(sol), np.array(its)
+                    "solved_at_eval_k": sol_eval[-1], "solved_at_kmax": sol[-1],
+                    "iters_to_solve": its[-1]}
+            sol, sol_eval, its = np.array(sol), np.array(sol_eval), np.array(its)
             color = COLORS.get(name, COLORS["MPNN"])
-            ax_s.errorbar(sizes, sol[:, 0] * 100, yerr=sol[:, 1] * 100, marker="o", capsize=3,
-                          color=color, label=name)
+            ax_s.errorbar(sizes, sol_eval[:, 0] * 100, yerr=sol_eval[:, 1] * 100, marker="o", capsize=3,
+                          color=color, label=f"{name}, K = {k_eval}")
+            if k_eval != kmax:
+                ax_s.errorbar(sizes, sol[:, 0] * 100, yerr=sol[:, 1] * 100, marker="s", capsize=3,
+                              color=color, ls="--", alpha=0.6, label=f"{name}, K_max = {kmax}")
             ax_i.errorbar(sizes, its[:, 0], yerr=its[:, 1], marker="o", capsize=3,
                           color=color, label=name)
         for ax in (ax_s, ax_i):
@@ -488,18 +512,18 @@ def build_report(res, meta, out_dir: Path, fps: int) -> None:
             ax.set_xticks(sizes)
             ax.grid(alpha=0.3)
             ax.legend(fontsize=9)
-        ax_s.set_ylabel(f"plateaux résolus à K_max = {kmax} (%)")
+        ax_s.set_ylabel("plateaux résolus (%)")
         ax_s.set_ylim(0, 102)
         ax_i.axhline(kmax, color="#111827", ls="--", lw=1)
         ax_i.set_ylabel("itérations pour résoudre (plateaux résolus)")
-        fig.suptitle("Figure 6 — généralisation en taille (pointillé vertical : taille d'entraînement ; "
-                     "tirets : K_max)", fontsize=11)
+        fig.suptitle("Figure 6 — généralisation en taille. Gauche : trait plein = K d'évaluation de chaque "
+                     "modèle, tirets = K_max ; pointillé vertical = taille d'entraînement", fontsize=10)
         fig.tight_layout(rect=(0, 0, 1, 0.94))
         pdf.savefig(fig)
         plt.close(fig)
 
         # ---- Fig 3: intermediate predictions, one page per size ----------------
-        shown = [k for k in (1, 3, 5, 10, 30) if k <= kmax] or [kmax]
+        shown = [k for k in (1, 3, 5, 10, 30, 100) if k <= kmax] or [kmax]
         for s in sizes:
             ex = meta["examples"][str(s)]
             inputs, labels = np.asarray(ex["inputs"]), np.asarray(ex["labels"])
@@ -675,6 +699,8 @@ def main() -> None:
     p.add_argument("--fps", type=int, default=3)
     p.add_argument("--allow-irregular", action="store_true",
                    help="also test sizes where the last agent overlaps its neighbour more than usual")
+    p.add_argument("--max-traj-agents", type=int, default=100,
+                   help="Fig. 4 / 8 and sheaf_xz GIF: largest board with at most this many agents")
     p.add_argument("--out-dir", default="comparisons/minesweeper")
     args = p.parse_args()
 
@@ -691,29 +717,42 @@ def main() -> None:
     train_mines = int(stored.get("mines", 5))
     density = train_mines / train**2
     sizes = sorted(set(args.sizes) | {train})
-    patch = int(ref.cfg.get("task_cfg", {}).get("patch_size", 5))
-    stride = int(ref.cfg.get("task_cfg", {}).get("stride", 2))
-    sizes = [s for s in sizes if s >= patch]
+    task_cfg = ref.cfg.get("task_cfg", {})
+    grid_layout = ref.cfg["task"] == "minesweeper_grid"
+    patch = int(task_cfg.get("patch_size", 3 if grid_layout else 5))
+    stride = int(task_cfg.get("stride", 2))
+    border = int(task_cfg.get("border", 1)) if grid_layout else 0
+    if not grid_layout:
+        sizes = [s for s in sizes if s >= patch]
     if not args.allow_irregular:
-        # (size - patch) not a multiple of stride: the last agent row / column is
-        # shifted by less than the stride, an overlap never seen in training.
-        irregular = [s for s in sizes if (s - patch) % stride]
+        # Slot layout: (size - patch) not a multiple of stride -> the last agent is shifted
+        # by less than the stride (unseen overlap). Grid layout: a size of the other parity
+        # than the training board changes how the border agents are cut (exact tiling for
+        # odd sizes, a double ring of padding on two sides for even sizes).
+        if grid_layout:  # same parity as the training board -> same cut of the border agents
+            irregular = [s for s in sizes if (s - train) % stride]
+        else:
+            irregular = [s for s in sizes if (s - patch) % stride]
         if irregular:
-            print(f"skipping sizes {irregular}: with {patch}x{patch} agents every {stride} cells the last "
-                  f"agent would be shifted by less than {stride} (unseen overlap). "
-                  f"Regular sizes: {patch} + {stride}n. Use --allow-irregular to keep them.")
-        sizes = [s for s in sizes if (s - patch) % stride == 0]
+            print(f"skipping sizes {irregular}: they are not cut like the training board "
+                  f"({patch}x{patch} agents every {stride} cells"
+                  + (f", {border}-cell outside ring: keep the parity of {train}" if grid_layout else "")
+                  + "). Use --allow-irregular to keep them.")
+        sizes = [s for s in sizes if s not in irregular]
 
     meta = {"sizes": sizes, "models": list(runs), "kmax": args.kmax, "train_size": train,
             "train_mines": train_mines, "boards": args.boards, "mines": {}, "sources": {},
-            "examples": {}, "trajectories": {}}
+            "examples": {}, "trajectories": {}, "agents": {},
+            "layout": (f"agents {patch}×{patch} tous les {stride} (protocole labyrinthe, anneau hors plateau)"
+                       if grid_layout else f"agents {patch}×{patch} tous les {stride}")}
     res = {name: [{"seed": m.seed, "train_k": m.train_k, "eval_k": m.eval_k, "metrics": {}, "examples": {}}
                   for m in models] for name, models in runs.items()}
     for s in sizes:
         mines = train_mines if s == train else max(1, round(density * s * s))
-        x, y, source = load_boards(s, mines, args.boards, args.seed, data_dir if s == train else None)
+        x, y, source = load_boards(s, mines, args.boards, args.seed, data_dir)
         meta["mines"][str(s)] = mines
         meta["sources"][str(s)] = source
+        meta["agents"][str(s)] = ref.num_agents(x, y)
         ex = min(args.example, len(x) - 1)
         meta["examples"][str(s)] = {"inputs": x[ex].tolist(), "labels": y[ex].tolist()}
         for name, models in runs.items():
@@ -732,10 +771,21 @@ def main() -> None:
                       f"{res[name][i]['metrics'][s]['solved'][k - 1] * 100:.1f}%  "
                       f"solved@{args.kmax} {res[name][i]['metrics'][s]['solved'][-1] * 100:.1f}%  "
                       f"({time.time() - t0:.1f}s)")
-        if s in (train, max(sizes)):
-            traj = ref.trajectory(x[ex], y[ex], args.kmax)
+        # Fig. 4 / 8: training size + the largest size with a readable number of agents
+        largest = max((t for t in sizes if t <= s and meta["agents"].get(str(t), 10**9) <= args.max_traj_agents),
+                      default=train)
+        if s == train or (s == max(sizes) and largest != train):
+            if s != train:
+                # same deterministic boards as the ones evaluated for that size
+                sx, sy = (x, y) if largest == s else load_boards(
+                    largest, meta["mines"][str(largest)], args.example + 1, args.seed, data_dir)[:2]
+                s_traj = largest
+            else:
+                sx, sy, s_traj = x, y, s
+            exi = min(args.example, len(sx) - 1)
+            traj = ref.trajectory(sx[exi], sy[exi], args.kmax)
             traj["xz2"] = project_xz(traj)
-            meta["trajectories"][f"{s}x{s}"] = traj
+            meta["trajectories"][f"{s_traj}x{s_traj}"] = traj
     for name in res:
         for r in res[name]:
             r.setdefault("num_params", 0)

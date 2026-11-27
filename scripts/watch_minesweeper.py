@@ -233,7 +233,6 @@ def mine_probabilities(args, ckpt, inputs, labels, ks) -> np.ndarray:
     """``[B, len(ks), cells]`` mine probability after k ADMM iterations."""
     import torch
 
-    from sheaf_admm.data import views as V
     from sheaf_admm.models import model_config_from_dict
     from sheaf_admm.training import build_model, make_task
     from sheaf_admm.training.loop import _forward, move_to_device
@@ -246,7 +245,7 @@ def mine_probabilities(args, ckpt, inputs, labels, ks) -> np.ndarray:
         params = ckpt["model_state"]
     task = make_task(cfg["task"], **cfg.get("task_cfg", {}))
     model = build_model(model_config_from_dict(cfg["model"]), cfg["model_type"]).to(device)
-    fwd, targets, _aux = task.prepare({"inputs": inputs, "labels": labels})
+    fwd, targets, aux = task.prepare({"inputs": inputs, "labels": labels})
     fwd, targets = move_to_device(fwd, device), move_to_device(targets, device)
     with torch.no_grad():  # materialize lazy layers before loading weights
         _forward(model, fwd, n_iter=1, loss_window=1, model_type=model_type, training=False)
@@ -259,7 +258,7 @@ def mine_probabilities(args, ckpt, inputs, labels, ks) -> np.ndarray:
                               training=False)
             if model_type == "sheaf":
                 logits = logits[-1]  # last ADMM iteration of the window
-            grid = V.reassemble_minesweeper_logits(logits.permute(1, 0, 2, 3), targets["cell_ids"])
+            grid = task.reassemble(logits, targets, aux)
             out.append(grid.softmax(dim=-1)[..., 1].cpu().numpy())
     return np.stack(out, axis=1)
 
@@ -287,7 +286,7 @@ def main() -> None:
 
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     cfg = ckpt["config"]
-    if cfg.get("task") != "minesweeper":
+    if cfg.get("task") not in ("minesweeper", "minesweeper_grid"):
         raise ValueError(f"expected a minesweeper checkpoint, got task={cfg.get('task')!r}")
     key = "K_eval" if cfg["model_type"] == "sheaf" else "mpnn_eval_rounds"
     k_eval = int(cfg["training"].get(key, 8))

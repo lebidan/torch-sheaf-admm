@@ -114,7 +114,11 @@ class MPNNModel(nn.Module):
         cell_ids=None,
         training=True,
         compile_steps=True,
+        return_history=False,
     ):
+        """Run ``num_rounds`` rounds; with ``return_history`` the logits after every
+        round are returned, stacked as ``[num_rounds, ...]`` (one pass instead of
+        one call per round count)."""
         c = self.config
         edge_indices = torch.as_tensor(edge_indices, device=patches.device, dtype=torch.long)
         node_positions = (
@@ -156,8 +160,18 @@ class MPNNModel(nn.Module):
             directed,
             types,
             num_rounds,
+            return_history=return_history,
             compile_round=compile_steps,
         )
+        if return_history:
+            hidden, history = hidden
+            if self.graph_head is not None:
+                return torch.stack([self.graph_head(h.mean(dim=0)) for h in history]), history
+            per_round = []
+            for h in history:
+                out = self.decoder(h.reshape(n * b, c.d_v), flat, training=training)
+                per_round.append(out.reshape(n, b, *out.shape[1:]))
+            return torch.stack(per_round), history
         if self.graph_head is not None:
             return self.graph_head(hidden.mean(dim=0)), hidden
         logits = self.decoder(hidden.reshape(n * b, c.d_v), flat, training=training)

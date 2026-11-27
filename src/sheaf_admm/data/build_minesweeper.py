@@ -40,6 +40,15 @@ Test-only sets for size generalisation (same mine density as 6x6 / 5 mines):
         --output-dir datasets/minesweeper_ood_12x12
 (give an explicit --output-dir: the default would overwrite datasets/minesweeper_9x9)
 
+Paper-style sets (task minesweeper_grid): 10k boards like the Maze sets, plus the
+size-generalisation splits test_ood_1.5x / 2x / 4x (13x13, 17x17, 33x33 at the
+9x9 density; 33x33 takes a few seconds per board, use several workers):
+    python -m sheaf_admm.data.build_minesweeper --size 9 --mines 10 --train-size 10000 \
+        --test-size 1000 --ood-sizes --workers 8 --output-dir datasets/minesweeper_grid_9x9
+    python -m sheaf_admm.data.build_minesweeper --size 6 --mines 5 --train-size 10000 \
+        --test-size 1000 --ood-sizes --workers 8 --output-dir datasets/minesweeper_grid_6x6
+    (6x6 -> test_ood_1.5x / 2x / 4x = 8x8, 12x12, 24x24 at the 6x6 density)
+
 Small boards have few distinct puzzles: 4x4 already repeats about half of its
 boards after 30k draws (risk of memorisation), 6x6 with 5 mines does not.
 """
@@ -73,6 +82,8 @@ class MinesweeperConfig:
     seed: int = 0
     workers: int = 1
     output_dir: Path | None = None  # default: datasets/minesweeper_<size>x<size>
+    ood_sizes: bool = False  # also write the size-generalisation test splits (see ood_suite)
+    ood_test_size: int | None = None  # boards per OOD split (default: test_size)
 
     def __post_init__(self) -> None:
         safe = self.size * self.size - self.mines
@@ -332,6 +343,27 @@ class _NoPool:
         return [fn(j) for j in jobs]
 
 
+def ood_suite(size: int, mines: int) -> list[tuple[str, int, int]]:
+    """``(split, size, mines)`` of the size-generalisation tests, as for the paper's Maze.
+
+    The Maze sets go from 19x19 to 29 (1.5x), 37 (2x) and 73 (4x). The sizes keep
+    the parity of the training size, because with 3x3 agents every 2 cells all
+    boards of one parity are cut the same way (odd: exact tiling; even: a double
+    ring of padding on the right / bottom side). 9x9 -> 13, 17, 33; 6x6 -> 8, 12, 24.
+    The mine density of the training board is kept.
+    """
+    density = mines / size**2
+    odd = size % 2
+    one_and_half = (3 * size - 1) // 2
+    if one_and_half % 2 != odd:
+        one_and_half += 1
+    out = []
+    for name, new in (("test_ood_1.5x", one_and_half), ("test_ood_2x", 2 * size - odd),
+                      ("test_ood_4x", 4 * size - 3 * odd)):
+        out.append((name, new, max(1, round(density * new * new))))
+    return out
+
+
 def build(cfg: MinesweeperConfig) -> None:
     inputs, labels = generate(cfg)
     # boards are distinct up to symmetry, so any split is symmetry-disjoint
@@ -341,7 +373,19 @@ def build(cfg: MinesweeperConfig) -> None:
     if cfg.train_size > 0:  # --train-size 0: test set only (e.g. larger boards for OOD tests)
         _write_split(cfg.output_dir, "train", inputs[train_idx], labels[train_idx], cfg.size)
     _write_split(cfg.output_dir, "test", inputs[test_idx], labels[test_idx], cfg.size)
-    (cfg.output_dir / "config.json").write_text(json.dumps(cfg.to_dict(), indent=2))
+    info = cfg.to_dict()
+    if cfg.ood_sizes:
+        info["ood"] = {}
+        count = cfg.ood_test_size or cfg.test_size
+        for split, size, mines in ood_suite(cfg.size, cfg.mines):
+            print(f"{split}: {size}x{size}, {mines} mines, {count} boards")
+            sub = MinesweeperConfig(size=size, mines=mines, train_size=0, test_size=count,
+                                    seed=cfg.seed + 1000 * size, workers=cfg.workers,
+                                    output_dir=cfg.output_dir)
+            x, y = generate(sub)
+            _write_split(cfg.output_dir, split, x, y, size)
+            info["ood"][split] = {"size": size, "mines": mines, "boards": count}
+    (cfg.output_dir / "config.json").write_text(json.dumps(info, indent=2))
     print(f"Done. Dataset saved to {cfg.output_dir}")
 
 
@@ -357,11 +401,15 @@ def parse_args() -> MinesweeperConfig:
     p.add_argument("--seed", type=int, default=d.seed)
     p.add_argument("--workers", type=int, default=d.workers)
     p.add_argument("--output-dir", type=Path, default=None)
+    p.add_argument("--ood-sizes", action="store_true",
+                   help="also write test_ood_1.5x / 2x / 4x splits (Maze-style size generalisation)")
+    p.add_argument("--ood-test-size", type=int, default=None, help="boards per OOD split")
     a = p.parse_args()
     return MinesweeperConfig(
         size=a.size, mines=a.mines, train_size=a.train_size, test_size=a.test_size,
         hidden_safe_min=a.hidden_safe_min, hidden_safe_max=a.hidden_safe_max,
         seed=a.seed, workers=a.workers, output_dir=a.output_dir,
+        ood_sizes=a.ood_sizes, ood_test_size=a.ood_test_size,
     )
 
 
