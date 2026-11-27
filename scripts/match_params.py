@@ -13,6 +13,9 @@ one dummy batch), so it follows any change in the code.
 
     # paper protocol (Maze-style): message sizes tied to d_v / 2, as in maze_mpnn.yaml
     python -m scripts.match_params minesweeper_grid_mpnn --match minesweeper_grid_sheaf --half-message
+
+    # a bigger MPNN: 4x the sheaf model's parameter count
+    python -m scripts.match_params minesweeper_grid_mpnn --match minesweeper_grid_sheaf --half-message --scale 4
 """
 
 from __future__ import annotations
@@ -87,7 +90,9 @@ def main() -> None:
     p.add_argument("--match", default=None,
                    help="experiment whose parameter count the first (MPNN) experiment should match")
     p.add_argument("--min-dv", type=int, default=8)
-    p.add_argument("--max-dv", type=int, default=512)
+    p.add_argument("--max-dv", type=int, default=1024)
+    p.add_argument("--scale", type=float, default=1.0,
+                   help="target = scale x the parameter count of --match (e.g. 4 for a bigger MPNN)")
     p.add_argument("--half-message", action="store_true",
                    help="tie d_e and the MPNN message size to d_v // 2 (paper's Maze PM: 84 / 42 / 42)")
     args = p.parse_args()
@@ -104,7 +109,7 @@ def main() -> None:
         print(f"{name}: {count_params(load_experiment(name)):,} parameters".replace(",", " "))
     if args.match is None:
         return
-    target = count_params(load_experiment(args.match))
+    target = int(round(args.scale * count_params(load_experiment(args.match))))
     cfg = load_experiment(args.experiments[0])
     lo, hi = args.min_dv, args.max_dv
     while hi - lo > 1:  # the count grows with d_v: bisection
@@ -115,7 +120,8 @@ def main() -> None:
             hi = mid
     best = min((lo, hi), key=lambda d: abs(count_params(cfg, overrides(d)) - target))
     got = count_params(cfg, overrides(best))
-    print(f"\ntarget ({args.match}): {target:,} parameters".replace(",", " "))
+    scale = f"{args.scale:g} x " if args.scale != 1 else ""
+    print(f"\ntarget ({scale}{args.match}): {target:,} parameters".replace(",", " "))
     print(f"{args.experiments[0]} with agent_state_dim={best}: {got:,} parameters "
           f"({(got - target) / target * 100:+.1f}%)".replace(",", " "))
     extra = (f" model.message_dim={max(1, best // 2)} model.mpnn_message_dim={max(1, best // 2)}"
