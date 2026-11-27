@@ -2,18 +2,42 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import torch
 
 
-def make_schedule(learning_rate: float, warmup_steps: int):
-    """Optax-compatible schedule: update 0 has LR zero during warmup."""
-    return lambda step: (
-        float(learning_rate) * min(1.0, step / warmup_steps)
-        if warmup_steps > 0
-        else float(learning_rate)
-    )
+def make_schedule(
+    learning_rate: float,
+    warmup_steps: int,
+    *,
+    kind: str = "constant",
+    total_steps: int | None = None,
+    min_lr_ratio: float = 0.0,
+):
+    """Optax-compatible schedule: update 0 has LR zero during warmup.
+
+    ``kind="constant"`` (default) keeps the LR flat after warmup. ``kind="cosine"``
+    decays it from ``learning_rate`` to ``min_lr_ratio * learning_rate`` over the
+    steps between the end of warmup and ``total_steps``.
+    """
+    lr = float(learning_rate)
+    if kind not in ("constant", "cosine"):
+        raise ValueError(f"unknown lr schedule {kind!r} (constant|cosine)")
+    if kind == "cosine" and (total_steps is None or total_steps <= warmup_steps):
+        raise ValueError("cosine schedule needs total_steps > warmup_steps")
+
+    def schedule(step):
+        if warmup_steps > 0 and step < warmup_steps:
+            return lr * step / warmup_steps
+        if kind == "constant":
+            return lr
+        progress = min(1.0, (step - warmup_steps) / (total_steps - warmup_steps))
+        floor = lr * float(min_lr_ratio)
+        return floor + (lr - floor) * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    return schedule
 
 
 def make_optimizer(

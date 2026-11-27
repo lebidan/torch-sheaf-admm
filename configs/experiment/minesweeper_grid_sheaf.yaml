@@ -1,0 +1,73 @@
+# @package _global_
+# Démineur, protocole de l'article (Maze, Table 1) : Sheaf-ADMM.
+#
+# Même découpage et mêmes hyperparamètres que maze_sheaf.yaml :
+#   * agents 3x3 tous les 2 (plateau entouré d'un anneau "hors plateau", comme les murs
+#     extérieurs du labyrinthe) : 9x9 -> 25 agents ; toutes les tailles impaires
+#     se découpent de la même façon (17x17 -> 81 agents, 33x33 -> 289) ;
+#   * 8 voisins, une application de restriction par direction, modulée par LoRA ;
+#   * K tiré uniformément dans [15, 40] à chaque pas, évaluation à K = 100 ;
+#   * d_v = 10, d_e = 5 (~ maze), 50 époques, lr 3e-4 constant, lots de 128.
+# Seuls changent : la tâche (2 classes : sûre / mine), le jeu de données et
+# l'augmentation dihédrale à la volée (le labyrinthe stocke ses 8 symétries).
+#
+# Données : python -m sheaf_admm.data.build_minesweeper --size 9 --mines 10 \
+#   --train-size 10000 --test-size 1000 --ood-sizes --workers 8 \
+#   --output-dir datasets/minesweeper_grid_9x9
+task: minesweeper_grid
+model_type: sheaf
+
+training:
+  lr: 3.0e-4
+  weight_decay: 1.0e-6
+  epochs: 50
+  batch_size: 128
+  lr_schedule: constant
+  K_train: 40
+  K_eval: 100
+  loss_window: 4
+  train_iters_dist: uniform   # K ~ U[15, 40] à chaque pas (comme le labyrinthe)
+  train_iters_min: 15
+  val_interval: 5
+  best_metric: solved         # checkpoint_best.pt : meilleur taux de plateaux résolus (test 9x9)
+
+data:
+  dir: datasets/minesweeper_grid_9x9
+  train_split: train
+  val_splits: [test, test_ood_1.5x, test_ood_2x, test_ood_4x]
+  loader: puzzle
+  augment: dihedral
+
+task_cfg:
+  patch_size: 3
+  stride: 2
+  connectivity: 8
+  border: 1
+  mine_weight: 1.0            # entropie croisée simple, comme l'article
+  mask_revealed: true
+  topk_decode: true
+
+model:
+  num_classes: 2
+  agent_state_dim: 10         # d_v
+  message_dim: 5              # d_e
+  encoder_arch: mlp_v2
+  enc_hidden_dim: 256
+  comm_norm_type: layernorm
+  objective_mode: l1box_diag
+  x_solver: diagonal_prox
+  z_solver: unrolled_cg
+  z_mode: prox
+  gamma: 5.0
+  cg_iters: 5
+  tikhonov_eps: 1.0e-5
+  rm_sharing: directional     # une application de base par direction (8)
+  rm_init: orthonormal
+  rm_mode: context            # modulée par LoRA selon le contexte
+  lora_rank: 4
+  lora_init_style: standard
+  num_directions: 8
+  rho_init: 0.25
+  decoder_arch: mlp_concat_v2
+  dec_hidden_dim: 256
+  dec_output_shape: [3, 3, 2]

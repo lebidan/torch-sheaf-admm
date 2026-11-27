@@ -36,7 +36,10 @@ class MPNNModel(nn.Module):
             enc_kwargs.update(d_model=c.enc_d_model, num_blocks=c.enc_num_blocks)
         self.encoder = create_encoder(c.encoder_arch, **enc_kwargs)
         self.init_hidden = Dense(c.d_v, c.d_v)
-        num_types = {"shared": 1, "spatial": c.num_directions, "slot": 9}[c.mpnn_edge_type_mode]
+        # "slot": one edge type per shared-cell position (rm_num_slots; 9 for Sudoku)
+        num_types = {"shared": 1, "spatial": c.num_directions, "slot": c.rm_num_slots}[
+            c.mpnn_edge_type_mode
+        ]
         self.ggnn = DirectionalGGNN(
             c.d_v, c.mpnn_message_dim or c.d_e, num_types, c.mpnn_aggregation, context_dim=c.d_v
         )
@@ -48,11 +51,13 @@ class MPNNModel(nn.Module):
         else:
             kwargs = {"comm_dim": c.d_v, "input_shape": input_shape}
             if c.decoder_arch == "mlp_concat_v2":
-                shape = (
-                    (*input_shape[:-1], c.num_classes)
-                    if input_shape is not None
-                    else (3, 3, c.num_classes)
-                )
+                shape = c.dec_output_shape
+                if shape is None:
+                    shape = (
+                        (*input_shape[:-1], c.num_classes)
+                        if input_shape is not None
+                        else (3, 3, c.num_classes)
+                    )
                 kwargs.update(
                     hidden_dim=c.dec_hidden_dim, output_shape=shape, dropout_rate=c.dropout_rate
                 )
@@ -109,7 +114,11 @@ class MPNNModel(nn.Module):
         cell_ids=None,
         training=True,
         compile_steps=True,
+        return_history=False,
     ):
+        """Run ``num_rounds`` rounds; with ``return_history`` the logits after every
+        round are returned, stacked as ``[num_rounds, ...]`` (one pass instead of
+        one call per round count)."""
         c = self.config
         edge_indices = torch.as_tensor(edge_indices, device=patches.device, dtype=torch.long)
         node_positions = (
@@ -151,8 +160,18 @@ class MPNNModel(nn.Module):
             directed,
             types,
             num_rounds,
+            return_history=return_history,
             compile_round=compile_steps,
         )
+        if return_history:
+            hidden, history = hidden
+            if self.graph_head is not None:
+                return torch.stack([self.graph_head(h.mean(dim=0)) for h in history]), history
+            per_round = []
+            for h in history:
+                out = self.decoder(h.reshape(n * b, c.d_v), flat, training=training)
+                per_round.append(out.reshape(n, b, *out.shape[1:]))
+            return torch.stack(per_round), history
         if self.graph_head is not None:
             return self.graph_head(hidden.mean(dim=0)), hidden
         logits = self.decoder(hidden.reshape(n * b, c.d_v), flat, training=training)

@@ -53,6 +53,35 @@ def dihedral_transform(arr: np.ndarray, tid: int) -> np.ndarray:
     raise ValueError(f"Unsupported dihedral transform index: {tid}")
 
 
+def random_dihedral_batch(
+    rng: np.random.Generator,
+    inputs: np.ndarray,
+    labels: np.ndarray,
+    height: int,
+    width: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Apply one random dihedral symmetry per example to flat ``[B, H*W]`` boards.
+
+    Inputs and labels of an example get the *same* symmetry. Square boards draw
+    from all 8 symmetries; non-square boards only from the 4 that keep ``H x W``
+    (identity, 180-degree rotation, both flips). Returns ``(inputs, labels, tids)``.
+    """
+    inputs, labels = np.asarray(inputs), np.asarray(labels)
+    b = inputs.shape[0]
+    if inputs.shape != (b, height * width) or labels.shape != (b, height * width):
+        raise ValueError(
+            f"expected inputs/labels of shape (B, {height * width}); "
+            f"got {inputs.shape} and {labels.shape}"
+        )
+    choices = np.arange(8) if height == width else np.array([0, 2, 4, 5])
+    tids = rng.choice(choices, size=b)
+    out_in, out_lab = np.empty_like(inputs), np.empty_like(labels)
+    for i, tid in enumerate(tids):
+        out_in[i] = dihedral_transform(inputs[i].reshape(height, width), int(tid)).reshape(-1)
+        out_lab[i] = dihedral_transform(labels[i].reshape(height, width), int(tid)).reshape(-1)
+    return out_in, out_lab, tids
+
+
 def inverse_dihedral_transform(arr: np.ndarray, tid: int) -> np.ndarray:
     """Undo :func:`dihedral_transform`."""
     return dihedral_transform(arr, DIHEDRAL_INVERSE[int(tid)])

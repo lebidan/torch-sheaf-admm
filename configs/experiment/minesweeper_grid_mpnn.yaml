@@ -1,0 +1,60 @@
+# @package _global_
+# Démineur, protocole de l'article (Maze, Table 1) : MPNN récurrent de référence.
+#
+# Même graphe d'agents que minesweeper_grid_sheaf.yaml (3x3 tous les 2, 8 directions,
+# un type d'arête par direction), mêmes hyperparamètres que maze_mpnn.yaml :
+# 40 tours fixes à l'entraînement, 100 à l'évaluation, agrégation max.
+#
+# Variante par défaut = PM (même nombre de paramètres que le sheaf). Comme pour le
+# labyrinthe (d_v = 84, d_e = message = 42), d_e et la taille des messages valent
+# d_v / 2. La valeur exacte de d_v vient de :
+#   uv run python -m scripts.match_params minesweeper_grid_mpnn --match minesweeper_grid_sheaf --half-message
+# (84 ci-dessous = valeur du labyrinthe, à remplacer par le résultat).
+# Variante CM (même communication que le sheaf) :
+#   model.agent_state_dim=10 model.message_dim=5 model.mpnn_message_dim=5
+task: minesweeper_grid
+model_type: mpnn
+
+training:
+  lr: 3.0e-4
+  weight_decay: 1.0e-6
+  epochs: 50
+  batch_size: 128
+  lr_schedule: constant
+  mpnn_train_rounds: 40
+  mpnn_eval_rounds: 100
+  mpnn_train_rounds_dist: fixed
+  val_interval: 5
+  best_metric: solved
+
+data:
+  dir: datasets/minesweeper_grid_9x9
+  train_split: train
+  val_splits: [test, test_ood_1.5x, test_ood_2x, test_ood_4x]
+  loader: puzzle
+  augment: dihedral
+
+task_cfg:
+  patch_size: 3
+  stride: 2
+  connectivity: 8
+  border: 1
+  mine_weight: 1.0
+  mask_revealed: true
+  topk_decode: true
+
+model:
+  num_classes: 2
+  agent_state_dim: 84         # d_v (PM : à ajuster avec scripts.match_params)
+  message_dim: 42             # d_e = d_v / 2
+  encoder_arch: mlp_v2
+  enc_hidden_dim: 256
+  comm_norm_type: layernorm
+  decoder_arch: mlp_concat_v2
+  dec_hidden_dim: 256
+  dec_output_shape: [3, 3, 2]
+  mpnn_message_dim: 42        # = d_v / 2
+  mpnn_aggregation: max       # la meilleure agrégation de l'article
+  mpnn_edge_type_mode: spatial
+  num_directions: 8
+  mpnn_graph_readout: per_node

@@ -1,0 +1,56 @@
+# @package _global_
+# Recurrent-MPNN Minesweeper 9x9 / 10 mines baseline, to compare with minesweeper_sheaf.yaml (same data,
+# agents, encoder, decoder and training schedule; only the coordination differs).
+#
+# * Same graph as the sheaf model: 9 agents of 5x5 cells; one edge per cell
+#   shared by two agents, typed by its position in the patch (slot mode,
+#   rm_num_slots = 25 edge types).
+# * Instead of ADMM consensus, agents exchange learned messages for a fixed number
+#   of rounds (GGNN with max aggregation, as in sudoku_mpnn.yaml).
+# * Rounds = the sheaf model's K_eval (12). Compare at several counts with:
+#   python -m scripts.eval_k --checkpoint .../checkpoint_best.pt --ks ...
+task: minesweeper
+model_type: mpnn
+
+training:
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  epochs: 40
+  lr_schedule: cosine
+  min_lr_ratio: 0.05
+  batch_size: 512
+  mpnn_train_rounds: 12
+  mpnn_eval_rounds: 12
+  val_interval: 1
+  best_metric: solved_topk
+
+data:
+  dir: datasets/minesweeper_9x9
+  train_split: train
+  val_splits: [test]
+  loader: puzzle
+  augment: dihedral
+
+task_cfg:
+  patch_size: 5
+  stride: 2
+  mine_weight: 2.0
+  mask_revealed: true
+  topk_decode: true
+
+model:
+  num_classes: 2
+  agent_state_dim: 200    # d_v: hidden state per agent, same size as the sheaf model
+  message_dim: 8         # d_e (unused by the GGNN messages, kept for symmetry)
+  encoder_arch: mlp
+  enc_hidden_dim: 256
+  dropout_rate: 0.1
+  comm_norm_type: layernorm
+  decoder_arch: mlp_concat_v2
+  dec_hidden_dim: 256
+  dec_output_shape: [25, 2]
+  mpnn_message_dim: 32
+  mpnn_aggregation: max
+  mpnn_edge_type_mode: slot
+  rm_num_slots: 25       # number of edge types (one per cell position in a patch)
+  mpnn_graph_readout: per_node

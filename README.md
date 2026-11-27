@@ -56,9 +56,17 @@ uv run python -m sheaf_admm.data.build_mnist \
 
 uv run python -m sheaf_admm.data.build_sudoku \
   --output-dir datasets/sudoku_easy
+
+uv run python -m sheaf_admm.data.build_N_Queens \
+  --output-dir datasets/n_queens_10x10 \
+  --train-size 10000 \
+  --test-size 1000
 ```
 
-The MNIST and Sudoku builders download their source datasets on first run.
+The MNIST, Sudoku, and N-Queens builders download their source datasets on first
+run. The N-Queens builder keeps only 10x10 puzzles with one valid solution; omit
+`--train-size` and `--test-size` to use every qualifying example in each official
+split.
 
 ## Training
 
@@ -77,6 +85,9 @@ uv run python scripts/train.py +experiment=mnist_mpnn
 uv run python scripts/train.py +experiment=sudoku_sheaf
 uv run python scripts/train.py +experiment=sudoku_sheaf_lora
 uv run python scripts/train.py +experiment=sudoku_mpnn
+
+# N-Queens (row/column agents, cross-entropy baseline)
+uv run python scripts/train.py +experiment=n_queens_sheaf
 ```
 
 Set `training.seed=42`, `123`, or `456` for the paper seeds. Set

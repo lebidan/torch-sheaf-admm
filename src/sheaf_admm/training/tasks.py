@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -145,8 +146,404 @@ class SudokuTask:
         }
 
 
+def _nqueens_board_metrics(predicted, labels, clues):
+    """Row/column/diagonal validity, clue preservation and exact-match for ``[B, N, N]`` bools."""
+    size = predicted.shape[1]
+    rows_valid = (predicted.sum(dim=2) == 1).all(dim=1)
+    columns_valid = (predicted.sum(dim=1) == 1).all(dim=1)
+    diagonals_valid = torch.ones(predicted.shape[0], dtype=torch.bool, device=predicted.device)
+    flipped = predicted.flip(dims=(2,))
+    for offset in range(-(size - 2), size - 1):
+        diagonals_valid &= torch.diagonal(predicted, offset, dim1=1, dim2=2).sum(dim=-1) <= 1
+        diagonals_valid &= torch.diagonal(flipped, offset, dim1=1, dim2=2).sum(dim=-1) <= 1
+    clues_preserved = (predicted | ~clues).all(dim=(1, 2))
+    valid = rows_valid & columns_valid & diagonals_valid & clues_preserved
+    correct = predicted == labels
+    return {
+        "cell_acc": correct.float().mean().item(),
+        "solved": correct.all(dim=(1, 2)).float().mean().item(),
+        "valid": valid.float().mean().item(),
+        "clues_preserved": clues_preserved.float().mean().item(),
+    }
+
+
+def max_weight_permutation(weights: torch.Tensor) -> torch.Tensor:
+    """Exact max-weight row->column assignment for ``[B, N, N]`` scores (bitmask DP).
+
+    Returns ``[B, N]`` long: the chosen column of each row. Cost is
+    ``O(N^2 * 2^N)`` per board, fine up to N ~ 14.
+    """
+    b, n, _ = weights.shape
+    if n > 16:
+        raise ValueError(f"bitmask permutation decoding supports N <= 16, got {n}")
+    device = weights.device
+    weights = weights.float()
+    full = 1 << n
+    masks = torch.arange(full, device=device)
+    popcount = torch.zeros(full, dtype=torch.long, device=device)
+    for c in range(n):
+        popcount += (masks >> c) & 1
+    neg_inf = torch.finfo(torch.float32).min
+    dp = torch.full((b, full), neg_inf, device=device)
+    dp[:, 0] = 0.0
+    choices = []
+    for r in range(n):
+        new = torch.full((b, full), neg_inf, device=device)
+        choice = torch.zeros((b, full), dtype=torch.long, device=device)
+        for c in range(n):
+            bit = 1 << c
+            src = masks[((masks & bit) == 0) & (popcount == r)]
+            dst = src | bit
+            cand = dp[:, src] + weights[:, r, c, None]
+            better = cand > new[:, dst]
+            new[:, dst] = torch.where(better, cand, new[:, dst])
+            choice[:, dst] = torch.where(better, torch.full_like(choice[:, dst], c), choice[:, dst])
+        dp = new
+        choices.append(choice)
+    cols = torch.zeros((b, n), dtype=torch.long, device=device)
+    mask = torch.full((b,), full - 1, dtype=torch.long, device=device)
+    for r in range(n - 1, -1, -1):
+        c = choices[r].gather(1, mask[:, None])[:, 0]
+        cols[:, r] = c
+        mask = mask ^ torch.bitwise_left_shift(torch.ones_like(c), c)
+    return cols
+
+
+class NQueensTask:
+    """N-Queens with line agents.
+
+    * ``diagonals`` — add one agent per main and anti diagonal (2(2N-1) extra
+      agents, padded to length N with input token 0 and ignored in the loss), so
+      the diagonal constraint is represented in the sheaf. Requires
+      ``rm_sharing: sudoku`` with ``rm_num_slots: 4N`` (typed per-slot maps).
+    * ``queen_weight`` — cross-entropy weight on the queen class (~N-1 for
+      balanced rows; queens are 1/N of the cells).
+    * ``perm_decode`` — also report ``*_perm`` metrics where the board is decoded
+      as the max-score permutation (exactly one queen per row and column, given
+      queens forced). Diagonals and the clue-implied solution are *not* imposed,
+      so a correct ``*_perm`` still reflects what the model learned.
+    """
+
+    name = "n_queens"
+    input_num_classes = 3
+    ignore_index = -100
+
+    def __init__(self, *, diagonals=False, queen_weight=1.0, perm_decode=True):
+        self.diagonals = bool(diagonals)
+        self.queen_weight = float(queen_weight)
+        self.perm_decode = bool(perm_decode)
+
+    def prepare(self, batch):
+        inputs = torch.as_tensor(batch["inputs"], dtype=torch.long)
+        labels = torch.as_tensor(batch["labels"], dtype=torch.long)
+        if inputs.ndim != 2 or labels.shape != inputs.shape:
+            raise ValueError("N-Queens inputs and labels must have the same [B, N*N] shape")
+
+        height, width = V.infer_image_hw(
+            inputs.shape[1], batch.get("height"), batch.get("width")
+        )
+        if height != width:
+            raise ValueError(f"N-Queens requires square boards, got {(height, width)}")
+        if not torch.isin(inputs, torch.tensor((0, 1, 2))).all():
+            raise ValueError("N-Queens inputs must use tokens 0, 1, and 2")
+        if not torch.isin(labels, torch.tensor((1, 2))).all():
+            raise ValueError("N-Queens labels must use tokens 1 (empty) and 2 (queen)")
+
+        batch_size = inputs.shape[0]
+        inputs_grid = inputs.reshape(batch_size, height, width)
+        labels_grid = (labels.reshape(batch_size, height, width) == 2).long()
+        edges, map_u, map_v = V.build_nqueens_multigraph(height, diagonals=self.diagonals)
+        cell_ids = V.build_nqueens_cell_indices(height, diagonals=self.diagonals)
+
+        # Slice the integer grid first so padded diagonal slots get input token 0.
+        input_tokens = V.nqueens_slice_batch_jax(
+            inputs_grid[..., None], diagonals=self.diagonals, pad_value=0
+        )[..., 0]
+        input_views = F.one_hot(input_tokens, num_classes=self.input_num_classes).float()
+        input_views = input_views.permute(1, 0, 2, 3)
+        label_views = V.nqueens_slice_batch_jax(
+            labels_grid[..., None], diagonals=self.diagonals, pad_value=self.ignore_index
+        )[..., 0].permute(1, 0, 2)
+        fwd = {
+            "patches": input_views,
+            "edge_indices": edges,
+            "model_kwargs": {
+                "map_u": map_u,
+                "map_v": map_v,
+                "cell_ids": cell_ids,
+            },
+        }
+        targets = {
+            "slice_labels": label_views,
+            "labels_grid": labels_grid,
+            "inputs_grid": inputs_grid,
+        }
+        return fwd, targets, {}
+
+    def loss(self, logits_window, targets):
+        labels = targets["slice_labels"]
+        expanded = labels.unsqueeze(0).expand(logits_window.shape[:-1])
+        weight = None
+        if self.queen_weight != 1.0:
+            weight = torch.tensor(
+                [1.0, self.queen_weight], dtype=logits_window.dtype, device=logits_window.device
+            )
+        return F.cross_entropy(
+            logits_window.reshape(-1, logits_window.shape[-1]),
+            expanded.reshape(-1).long(),
+            weight=weight,
+            ignore_index=self.ignore_index,
+        )
+
+    def evaluate(self, logits_final, targets, aux):
+        logits_grid = V.reassemble_nqueens_logits(logits_final.permute(1, 0, 2, 3))
+        labels = targets["labels_grid"].bool()
+        clues = targets["inputs_grid"] == 2
+        metrics = _nqueens_board_metrics(logits_grid.argmax(dim=-1) == 1, labels, clues)
+        if self.perm_decode:
+            score = logits_grid[..., 1] - logits_grid[..., 0]
+            score = torch.where(clues, torch.full_like(score, 1e4), score)
+            cols = max_weight_permutation(score)
+            perm = torch.zeros_like(clues)
+            perm.scatter_(2, cols[..., None], True)
+            perm_metrics = _nqueens_board_metrics(perm, labels, clues)
+            for key in ("cell_acc", "solved", "valid"):
+                metrics[f"{key}_perm"] = perm_metrics[key]
+        return metrics
+
+
+class MinesweeperTask:
+    """Minesweeper with overlapping ``patch x patch`` agents.
+
+    Inputs come from :mod:`sheaf_admm.data.build_minesweeper`: token 1 = hidden
+    cell, ``2 + n`` = revealed cell showing ``n``; labels 1 = safe, 2 = mine.
+    Every agent predicts mine / safe for its cells; predictions of the agents
+    sharing a cell are averaged.
+
+    * ``patch_size`` / ``stride`` — agent layout (5 / 2: 9 agents on 9x9);
+      every 3x3 neighbourhood must fit inside one agent (checked).
+    * ``mine_weight`` — cross-entropy weight of the mine class.
+    * ``mask_revealed`` — revealed cells are safe by definition; leave them out
+      of the loss and of the metrics (they would inflate the accuracy).
+    * ``topk_decode`` — also report ``*_topk`` metrics: the ``m`` hidden cells
+      with the highest mine score are mines, ``m`` being the board's mine count
+      (the player knows it). It plays the role of N-Queens' ``*_perm``.
+    """
+
+    name = "minesweeper"
+    input_num_classes = 11
+    ignore_index = -100
+
+    def __init__(
+        self, *, patch_size=5, stride=2, mine_weight=1.0, mask_revealed=True, topk_decode=True
+    ):
+        self.patch_size = int(patch_size)
+        self.stride = int(stride)
+        self.mine_weight = float(mine_weight)
+        self.mask_revealed = bool(mask_revealed)
+        self.topk_decode = bool(topk_decode)
+
+    def _check_batch(self, batch, square=True):
+        inputs = torch.as_tensor(batch["inputs"], dtype=torch.long)
+        labels = torch.as_tensor(batch["labels"], dtype=torch.long)
+        if inputs.ndim != 2 or labels.shape != inputs.shape:
+            raise ValueError("Minesweeper inputs and labels must have the same [B, H*W] shape")
+        height, width = V.infer_image_hw(inputs.shape[1], batch.get("height"), batch.get("width"))
+        if square and height != width:
+            raise ValueError(f"Minesweeper requires square boards, got {(height, width)}")
+        if inputs.min() < 1 or inputs.max() >= self.input_num_classes:
+            raise ValueError("Minesweeper inputs must use tokens 1 (hidden) and 2..10 (numbers)")
+        if not torch.isin(labels, torch.tensor((1, 2))).all():
+            raise ValueError("Minesweeper labels must use tokens 1 (safe) and 2 (mine)")
+        return inputs, labels, height, width
+
+    def prepare(self, batch):
+        inputs, labels, height, width = self._check_batch(batch)
+
+        cell_ids, edges, map_u, map_v = V.build_minesweeper_graph(
+            height, self.patch_size, self.stride
+        )
+        hidden = inputs == 1
+        mines = (labels == 2).long()
+        target = mines.masked_fill(~hidden, self.ignore_index) if self.mask_revealed else mines
+
+        input_views = F.one_hot(
+            V.minesweeper_slice_batch(inputs, cell_ids), num_classes=self.input_num_classes
+        ).float()
+        fwd = {
+            "patches": input_views.permute(1, 0, 2, 3),  # [A, B, L, C]
+            "edge_indices": edges,
+            "model_kwargs": {"map_u": map_u, "map_v": map_v, "cell_ids": cell_ids},
+        }
+        targets = {
+            "slice_labels": V.minesweeper_slice_batch(target, cell_ids).permute(1, 0, 2),
+            "mines": mines.bool(),
+            "hidden": hidden,
+            "cell_ids": cell_ids,
+        }
+        return fwd, targets, {}
+
+    def loss(self, logits_window, targets):
+        labels = targets["slice_labels"]
+        expanded = labels.unsqueeze(0).expand(logits_window.shape[:-1])
+        weight = None
+        if self.mine_weight != 1.0:
+            weight = torch.tensor(
+                [1.0, self.mine_weight], dtype=logits_window.dtype, device=logits_window.device
+            )
+        return F.cross_entropy(
+            logits_window.reshape(-1, logits_window.shape[-1]),
+            expanded.reshape(-1).long(),
+            weight=weight,
+            ignore_index=self.ignore_index,
+        )
+
+    @staticmethod
+    def _board_metrics(predicted, mines, scored):
+        correct = (predicted == mines) | ~scored
+        return {
+            "cell_acc": ((predicted == mines) & scored).sum().item() / max(scored.sum().item(), 1),
+            "solved": correct.all(dim=1).float().mean().item(),
+        }
+
+    def reassemble(self, logits, targets, aux):
+        """Per-agent logits ``[A, B, L, 2]`` -> board logits ``[B, S*S, 2]``."""
+        return V.reassemble_minesweeper_logits(logits.permute(1, 0, 2, 3), targets["cell_ids"])
+
+    def agent_positions(self, targets, aux):
+        """``[A, 2]`` (row, col) of each agent's top-left cell, for figures."""
+        cell_ids = torch.as_tensor(targets["cell_ids"]).cpu().numpy()
+        size = int(round(targets["hidden"].shape[1] ** 0.5))
+        return np.stack([cell_ids[:, 0] // size, cell_ids[:, 0] % size], 1)
+
+    def evaluate(self, logits_final, targets, aux):
+        logits = self.reassemble(logits_final, targets, aux)
+        mines, hidden = targets["mines"], targets["hidden"]
+        scored = hidden if self.mask_revealed else torch.ones_like(hidden)
+        predicted = (logits.argmax(dim=-1) == 1) & hidden  # revealed cells are safe
+        metrics = self._board_metrics(predicted, mines, scored)
+        mine_cells = mines & scored
+        metrics["mine_recall"] = (predicted & mine_cells).sum().item() / max(
+            mine_cells.sum().item(), 1
+        )
+        if self.topk_decode:
+            score = (logits[..., 1] - logits[..., 0]).masked_fill(~hidden, float("-inf"))
+            order = score.argsort(dim=1, descending=True)
+            rank = torch.empty_like(order)
+            positions = torch.arange(order.shape[1], device=order.device).repeat(order.shape[0], 1)
+            rank.scatter_(1, order, positions)
+            topk = (rank < mines.sum(dim=1, keepdim=True)) & hidden
+            for key, value in self._board_metrics(topk, mines, scored).items():
+                metrics[f"{key}_topk"] = value
+        return metrics
+
+
+class MinesweeperGridTask(MinesweeperTask):
+    """Minesweeper with the paper's maze layout (``task: minesweeper_grid``).
+
+    Same boards, tokens, loss and metrics as :class:`MinesweeperTask`; only the
+    agents change, to follow the Maze setup of the article:
+
+    * the board is surrounded by a ``border``-cell ring of the token 0
+      ("outside the board"), the analogue of the maze's outer walls: an agent
+      sees explicitly where the board ends;
+    * agents are ``patch_size x patch_size`` patches centred every ``stride``
+      cells of that padded image (3x3 every 2 cells, as for Maze), linked to
+      their ``connectivity`` grid neighbours (8: one restriction map / edge type
+      per direction);
+    * nothing depends on the board size, so a model runs on any size. With 3x3 / 2,
+      all boards of the same parity are cut the same way: odd sizes tile exactly
+      (9x9 -> 25 agents, 17x17 -> 81, 33x33 -> 289), even sizes get a double ring
+      of padding on the right / bottom side (6x6 -> 16 agents, 12x12 -> 49,
+      24x24 -> 169). Train on one size, test on sizes of the same parity.
+
+    Neighbouring agents share one row / column / corner cell, so the 3x3
+    neighbourhood of a number is usually split between agents: checking it
+    needs communication (the point of the benchmark).
+    """
+
+    name = "minesweeper_grid"
+    outside_token = 0
+
+    def __init__(
+        self,
+        *,
+        patch_size=3,
+        stride=2,
+        connectivity=8,
+        border=1,
+        mine_weight=1.0,
+        mask_revealed=True,
+        topk_decode=True,
+    ):
+        super().__init__(
+            patch_size=patch_size,
+            stride=stride,
+            mine_weight=mine_weight,
+            mask_revealed=mask_revealed,
+            topk_decode=topk_decode,
+        )
+        self.connectivity = int(connectivity)
+        self.border = int(border)
+
+    def layout(self, height, width):
+        """Agent centres (padded-board coordinates), edges and positions."""
+        b = self.border
+        return _grid_graph((height + 2 * b, width + 2 * b), self.stride, self.patch_size,
+                           self.connectivity)
+
+    def _pad(self, img, value):
+        b = self.border
+        return F.pad(img.float(), (b, b, b, b), value=float(value)).long()
+
+    def prepare(self, batch):
+        inputs, labels, height, width = self._check_batch(batch, square=False)
+        count = inputs.shape[0]
+        centers, edges, positions = self.layout(height, width)
+        board = self._pad(inputs.reshape(count, height, width), self.outside_token)
+        patches = V.prepare_maze_patches(
+            board, centers, self.patch_size, self.input_num_classes,
+            border_fill=self.outside_token,
+        )  # [N, B, ps, ps, 11]
+        hidden = inputs == 1
+        mines = (labels == 2).long()
+        target = mines.masked_fill(~hidden, self.ignore_index) if self.mask_revealed else mines
+        target_img = self._pad(target.reshape(count, height, width), self.ignore_index)
+        label_patches, inside = V.get_agent_label_patches_jax(target_img, centers, self.patch_size)
+        label_patches = label_patches.masked_fill(inside == 0, self.ignore_index)
+        fwd = {
+            "patches": patches,
+            "edge_indices": edges,
+            "model_kwargs": {"node_positions": positions},
+        }
+        targets = {"slice_labels": label_patches.long(), "mines": mines.bool(), "hidden": hidden}
+        aux = {"centers": centers, "image_hw": (height, width)}
+        return fwd, targets, aux
+
+    def reassemble(self, logits, targets, aux):
+        """Per-agent logits ``[N, B, ps, ps, 2]`` -> board logits ``[B, H*W, 2]`` (mean)."""
+        height, width = aux["image_hw"]
+        b = self.border
+        grid = V.reassemble_logits(
+            logits, aux["centers"], (height + 2 * b, width + 2 * b), logits.shape[-1], mode="mean"
+        )
+        board = grid[:, b:b + height, b:b + width]
+        return board.reshape(board.shape[0], height * width, board.shape[-1])
+
+    def agent_positions(self, targets, aux):
+        """``[N, 2]`` (row, col) of each agent's centre on the board, for figures."""
+        return np.asarray(aux["centers"]) - self.border
+
+
 def make_task(name: str, **kwargs):
-    tasks = {"maze": MazeTask, "mnist": MNISTTask, "sudoku": SudokuTask}
+    tasks = {
+        "maze": MazeTask,
+        "mnist": MNISTTask,
+        "sudoku": SudokuTask,
+        "n_queens": NQueensTask,
+        "minesweeper": MinesweeperTask,
+        "minesweeper_grid": MinesweeperGridTask,
+    }
     if name not in tasks:
         raise KeyError(f"unknown task {name!r}; available: {sorted(tasks)}")
     return tasks[name](**kwargs)

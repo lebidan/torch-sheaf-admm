@@ -1,0 +1,76 @@
+# @package _global_
+# Sheaf-ADMM N-Queens: row, column and diagonal agents with per-slot restriction maps.
+#
+# * diagonals: one agent per main / anti diagonal (2(2N-1) extra agents) so the
+#   diagonal constraint lives in the sheaf, not only in the labels.
+# * rm_sharing: sudoku + rm_num_slots: 4N gives every (agent type, line position)
+#   its own restriction map; soft_slice makes position k select stalk block k,
+#   so an edge at cell (r, c) compares exactly that cell's block on both sides.
+#   (A single global map made all edges of an agent carry the same message.)
+# * queen_weight: queens are 1/N of the cells; up-weight them in the CE.
+# * perm_decode: also report *_perm metrics (max-score permutation decoding).
+# * augment: dihedral — the 8 board symmetries preserve the N-Queens rules and the
+#   uniqueness of the solution; fights memorizing (clues -> solution) pairs
+#   (10-queens has only 724 solutions). Plus dropout / weight decay.
+# * K_train 40: more ADMM rounds to propagate constraints; 80 epochs
+#   (run 2 was still improving at epoch 39); checkpoint_best.pt on solved_perm;
+#   cosine LR decay to 5% of lr to consolidate the end of training.
+# * batch_size 64: K_train=40 keeps twice the ADMM activations for backprop;
+#   batch 128 runs out of memory on a 12 GB GPU.
+# * data.dir: symmetry-disjoint split (build_N_Queens_orbits). In the HF split every
+#   test puzzle is a rotation/reflection of a train puzzle, which dihedral
+#   augmentation leaks into training. Old split: data.dir=datasets/n_queens_10x10
+# * K random in [20, 40]: with a fixed K=40 the model was only right at exactly
+#   40 iterations (100% at K=40, 82% at K=80); a random K forces it to stabilise.
+task: n_queens
+model_type: sheaf
+
+training:
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  epochs: 80
+  lr_schedule: cosine
+  min_lr_ratio: 0.05
+  batch_size: 64
+  K_train: 40            # max ADMM iterations during training
+  train_iters_dist: uniform
+  train_iters_min: 20     # K drawn uniformly in [20, 40] at every training step
+  K_eval: 40
+  loss_window: 2
+  val_interval: 1
+  best_metric: solved_perm
+
+data:
+  dir: datasets/n_queens_10x10_orbits
+  train_split: train
+  val_splits: [test]
+  loader: puzzle
+  augment: dihedral
+
+task_cfg:
+  diagonals: true
+  queen_weight: 3.0
+  perm_decode: true
+
+model:
+  num_classes: 2
+  d_v: 160               # 10 line positions x 16-dim blocks
+  d_e: 16
+  encoder_arch: mlp
+  enc_hidden_dim: 256
+  dropout_rate: 0.1
+  comm_norm_type: layernorm
+  objective_mode: non_negative
+  x_solver: diagonal_prox
+  z_solver: unrolled_cg
+  z_mode: prox
+  gamma: 2.0
+  cg_iters: 5
+  rm_sharing: sudoku     # per-slot maps (alias: slot)
+  rm_num_slots: 40       # 4 agent types x N=10 positions
+  rm_init: soft_slice
+  rm_mode: fixed
+  rho_init: 0.25
+  decoder_arch: mlp_concat_v2
+  dec_hidden_dim: 256
+  dec_output_shape: [10, 2]

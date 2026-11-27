@@ -4,7 +4,7 @@
 defaults:
   - _self_
 
-task: maze            # maze | mnist | sudoku  (selects the task hook)
+task: maze            # maze | mnist | sudoku | n_queens  (selects the task hook)
 model_type: sheaf     # sheaf | mpnn
 
 wandb:
@@ -21,11 +21,14 @@ training:
   weight_decay: 1.0e-6
   epochs: 50
   batch_size: 128
-  warmup_steps: 200   # linear warmup -> constant LR
+  warmup_steps: 200   # linear warmup -> constant LR (or cosine decay, see lr_schedule)
+  lr_schedule: constant   # constant | cosine (decay to min_lr_ratio * lr by the last epoch)
+  min_lr_ratio: 0.0
   grad_clip: 1.0      # global-norm clip
   ema_decay: 0.999    # EMA of params, used at eval
   exit_on_nan: true
   val_interval: 5
+  best_metric: null   # e.g. solved_perm: also keep checkpoint_best.pt (first val split)
 
   # ADMM horizon (Sheaf): K_train iterations at train, K_eval at eval.
   K_train: 40
@@ -37,12 +40,15 @@ training:
   # MPNN baseline message-passing rounds (the K analog for the recurrent MPNN).
   mpnn_train_rounds: 40
   mpnn_eval_rounds: 100
+  mpnn_train_rounds_dist: fixed   # fixed | uniform (rounds ~ U[mpnn_train_rounds_min, mpnn_train_rounds])
+  mpnn_train_rounds_min: 1
 
 data:
   dir: ???            # set per experiment
   train_split: train
   val_splits: [test]
   loader: puzzle      # puzzle (maze/sudoku) | image (mnist)
+  augment: none       # none | dihedral (random rotation/flip per training puzzle)
 
 # kwargs forwarded to the task hook (sheaf_admm.training.make_task)
 task_cfg: {}
